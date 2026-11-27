@@ -267,7 +267,7 @@ class Progress:
                 _end_step()
                 _write(f"  {self.label}: {pct}% ({human(self.done)} of {human(self.total)})\n")
         if self.total:
-            set_title(f"HeyListen - {self.done * 100 // self.total}% downloaded")
+            set_title(f"Star Wars: Galactic Racer - {self.done * 100 // self.total}% downloaded")
 
     def render(self, now: float | None = None) -> str:
         now = self.clock() if now is None else now
@@ -321,7 +321,7 @@ class Progress:
                     _write("\r\x1b[K")
                 else:
                     _write("\r" + " " * self.prev_len + "\r")
-            set_title("HeyListen")
+            set_title("Star Wars: Galactic Racer")
 
 
 def _log_location() -> Path:
@@ -409,7 +409,7 @@ def ui_init(plain: bool = False) -> None:
     _ANSI = bool(tty and not plain and not os.environ.get("NO_COLOR") and _enable_vt())
     if tty:
         _quickedit_off()
-    set_title("HeyListen")
+    set_title("Star Wars: Galactic Racer")
 
 
 def stdin_is_tty() -> bool:

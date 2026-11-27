@@ -2589,7 +2589,7 @@ class LauncherUI:
         p.circle(x + 5, 626 + p.height('caption') // 2, 4, self.status_tone())
         p.text('caption', self.status, x + 18, 626, INK_DIM, max_width=700)
         self.draw_hints(p, [('A / ENTER', 'Select'), ('START / F1', 'Settings')])
-        p.text('caption', 'sable-loop v' + APP_VERSION, CANVAS[0] - MARGIN, 674, INK_FAINT, align='right')
+        p.text('caption', f'{GAME_NAME} v' + APP_VERSION, CANVAS[0] - MARGIN, 674, INK_FAINT, align='right')
 
     def draw_progress(self, p, dt):
         p.scene(scrim=150)
