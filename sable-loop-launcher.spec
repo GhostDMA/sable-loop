@@ -8,7 +8,6 @@ import sysconfig
 packages = Path(sysconfig.get_path('purelib'))
 datas, binaries, hidden = collect_all('curl_cffi')
 datas += [(str(src / 'Get-HeyListen.py'), '.'), (str(Path(SPECPATH) / 'assets/keyart-bg.png'), 'assets')]
-datas += [(str(orig / name), '.') for name in ('Update-Game.ps1', 'Apply-HeyListen-Preset.ps1')]
 binaries += [(str(dist / 'SDL2-2.30.10/SDL2-2.30.10/lib/x64/SDL2.dll'), '.'),
              (str(packages / 'sdl2dll/dll/SDL2_ttf.dll'), '.'),
              (str(packages / 'sdl2dll/dll/SDL2_image.dll'), '.')]

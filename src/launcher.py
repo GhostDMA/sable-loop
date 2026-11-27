@@ -25,7 +25,6 @@ except ImportError:
 import game_state
 from quit_control import top_right
 from window_state import WindowController
-from update_resources import resolve_update_script
 try:
     import build_flags
 except ModuleNotFoundError as exc:
@@ -1708,12 +1707,6 @@ class LauncherUI:
                             raise
                         events.publish('status', 'Connection stalled — retrying…')
                 events.publish('tool_check', release.get('tag_name', 'unknown'))
-                if installed(self.folder):
-                    script = resolve_update_script(BASE)
-                    if script is None:
-                        raise FileNotFoundError('Update-Game.ps1 not found')
-                    result = subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-File', str(script), '-DryRun', '-GameFolder', str(self.folder)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-                    events.publish('upstream_check', result.returncode)
             except Exception:
                 log_message('Update check failed:\n' + traceback.format_exc())
                 events.publish('offline', 'Could not reach the update server')
@@ -2153,8 +2146,6 @@ class LauncherUI:
                 self.operation = None
                 self.status = f'{GAME_NAME} is up to date.'
                 self.set_screen('main')
-            elif kind == 'upstream_check' and value == 10:
-                self.status = 'An upstream builder update is available.'
         if self.game_completion_until is not None and time.monotonic() >= self.game_completion_until:
             self.game_completion_until = None
             self.operation = None

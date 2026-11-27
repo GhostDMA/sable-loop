@@ -44,7 +44,6 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import quote, urlparse
 import qa_pause
-from update_resources import resolve_update_script
 
 try:
     import build_flags
@@ -1826,7 +1825,7 @@ def check_self_update(s: "requests.Session", man: dict, args: list[str],
         replacement = stage_executable(zp, stage, target.name)
         helper = stage / 'update-helper.exe'
         shutil.copy2(target, helper)
-        gui_relaunch = not args
+        gui_relaunch = not args or ('--self-update' in args and not set(args) - {'--self-update', '--no-pause', '--plain'})
         if '--self-update' in args:
             rest = [arg for arg in args if arg != '--self-update']
         else:
@@ -1839,10 +1838,13 @@ def check_self_update(s: "requests.Session", man: dict, args: list[str],
             rest = ['--gui', '--no-self-update']
         check_parent_alive()
         helper_env = dict(os.environ)
-        helper_env.pop('SILVER_LANTERN_PARENT_PID', None)
+        window_pid = helper_env.pop('SILVER_LANTERN_PARENT_PID', None)
+        helper_env.pop('SILVER_LANTERN_PARENT_CREATION_TIME', None)
+        helper_env['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
         spawn_started = time.monotonic()
         helper_env['SILVER_LANTERN_UPDATE_SPAWN_MONOTONIC'] = str(spawn_started)
-        subprocess.Popen([str(helper), '--apply-update-internal', str(target), str(replacement), str(os.getpid()), *rest], cwd=str(target.parent), env=helper_env)
+        subprocess.Popen([str(helper), '--apply-update-internal', str(target), str(replacement), window_pid or str(os.getpid()), *rest], cwd=str(target.parent), env=helper_env,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         log_update_phase('helper spawned', spawn_started)
         _self_update_started = True
     except BaseException:
@@ -2985,45 +2987,16 @@ def _update_say(message: str) -> None:
 
 
 def run_game_update(folder: Path, dry_run: bool = False, force: bool = False, silent: bool = False) -> int:
-    script = resolve_update_script(HERE)
-    if script is None:
-        _update_say('Update failed: Update-Game.ps1 not found.')
-        return 1
-    args = ['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(script), '-GameFolder', str(folder)]
+    import launcher
     if dry_run:
-        args.append('-DryRun')
-    if force:
-        args.append('-Force')
-    fields = {}
-    shown = False
-    try:
-        UPDATE_LOG.parent.mkdir(parents=True, exist_ok=True)
-        with UPDATE_LOG.open('a', encoding='utf-8', errors='replace') as output:
-            proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', bufsize=1)
-            import launcher
-            for line in launcher.child_output(proc, 'Game update'):
-                output.write(line)
-                output.flush()
-                parsed = parse_update_line(line)
-                fields.update(parsed)
-                # The script emits its error reason after status=error.
-                if not silent and parsed.get('status') not in (None, 'error'):
-                    message = render_update_status(fields)
-                    if message:
-                        _update_say(message)
-                        shown = True
-            try:
-                code = update_exit_code(proc.wait(timeout=10))
-            except subprocess.TimeoutExpired:
-                launcher.stop_child(proc)
-                raise TimeoutError('Game update did not exit. Please retry and check the log.')
-        if silent or (not shown and (fields.get('status') == 'error' or code)):
-            message = render_update_status(fields) or 'Update failed: update check failed.'
-            _update_say(message)
-        return code
-    except (OSError, ValueError) as e:
-        _update_say('Update failed: ' + str(e))
-        return 1
+        with stream_session() as client:
+            manifest = launcher.fetch_channel_manifest(folder, client)
+        current = launcher.installed_manifest_digest(folder) == launcher.manifest_digest(manifest)
+        _update_say('Already up to date.' if current else 'Game update available.')
+        return 0
+    options = argparse.Namespace(game_manifest=None, dry_run=False, prune=False, keep_assets=False)
+    install_from_manifest(None, options, folder)
+    return 0
 
 
 def relocate_transient() -> bool:
