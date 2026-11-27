@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 CHANNEL_URL = 'https://raw.githubusercontent.com/GhostDMA/sable-loop/game-channel/channel.json'
-ASSET_BASE = 'https://github.com/GhostDMA/sable-loop/releases/download/game-v1/'
+ASSET_BASE = 'https://github.com/GhostDMA/sable-loop/releases/download/v1.0.0/'
 LEGACY_URL = ASSET_BASE + 'game-manifest.json'
 
 

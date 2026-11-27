@@ -64,7 +64,7 @@ def _test_gui_install_enabled():
     return _TEST_GUI_INSTALL and _TEST_VIDEO_DRIVER == 'dummy' and bool(_TEST_GAME_MANIFEST)
 
 GAME_NAME = 'Star Wars: Galactic Racer'
-MANIFEST_URL = 'https://github.com/GhostDMA/sable-loop/releases/download/game-v1/game-manifest.json'
+MANIFEST_URL = 'https://github.com/GhostDMA/sable-loop/releases/download/v1.0.0/game-manifest.json'
 
 
 def game_manifest_url():

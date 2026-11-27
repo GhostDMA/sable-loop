@@ -1832,8 +1832,8 @@ def check_self_update(s: "requests.Session", man: dict, args: list[str],
 
 
 # ---------------------------------------------------------------- main
-GAME_MANIFEST_URL = "https://github.com/GhostDMA/sable-loop/releases/download/game-v1/game-manifest.json"
-GAME_ASSET_URL = "https://github.com/GhostDMA/sable-loop/releases/download/game-v1/"
+GAME_MANIFEST_URL = "https://github.com/GhostDMA/sable-loop/releases/download/v1.0.0/game-manifest.json"
+GAME_ASSET_URL = "https://github.com/GhostDMA/sable-loop/releases/download/v1.0.0/"
 
 
 def game_asset_base():
