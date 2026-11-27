@@ -927,7 +927,7 @@ def load_manifest(manifest_arg: str | None) -> dict:
         kind = "url" if manifest_arg.startswith(("http://", "https://")) else "file"
         candidates.append((manifest_arg, kind))
     if not manifest_arg and not MANIFEST_LOCAL.exists():
-        candidates.append(('https://raw.githubusercontent.com/cputroll/sable-loop/main/sources.json', 'url'))
+        candidates.append(('https://raw.githubusercontent.com/GhostDMA/sable-loop/main/sources.json', 'url'))
     if MANIFEST_LOCAL.exists():
         try:
             local = json.loads(MANIFEST_LOCAL.read_text(encoding="utf-8-sig"))
@@ -1772,7 +1772,7 @@ def check_self_update(s: "requests.Session", man: dict, args: list[str],
             raise
         sys.exit(0)
     # Executable updates must not be redirected by the mutable sources manifest.
-    rel = latest_app_release(s, "cputroll/sable-loop")
+    rel = latest_app_release(s, "GhostDMA/sable-loop")
     if rel is None:
         log(f"Self-update: no stable vX.Y.Z release found, up to date ({APP_VERSION})")
         return
@@ -1832,8 +1832,8 @@ def check_self_update(s: "requests.Session", man: dict, args: list[str],
 
 
 # ---------------------------------------------------------------- main
-GAME_MANIFEST_URL = "https://github.com/cputroll/sable-loop/releases/download/game-v1/game-manifest.json"
-GAME_ASSET_URL = "https://github.com/cputroll/sable-loop/releases/download/game-v1/"
+GAME_MANIFEST_URL = "https://github.com/GhostDMA/sable-loop/releases/download/game-v1/game-manifest.json"
+GAME_ASSET_URL = "https://github.com/GhostDMA/sable-loop/releases/download/game-v1/"
 
 
 def game_asset_base():

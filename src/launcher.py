@@ -64,7 +64,7 @@ def _test_gui_install_enabled():
     return _TEST_GUI_INSTALL and _TEST_VIDEO_DRIVER == 'dummy' and bool(_TEST_GAME_MANIFEST)
 
 GAME_NAME = 'Star Wars: Galactic Racer'
-MANIFEST_URL = 'https://github.com/cputroll/sable-loop/releases/download/game-v1/game-manifest.json'
+MANIFEST_URL = 'https://github.com/GhostDMA/sable-loop/releases/download/game-v1/game-manifest.json'
 
 
 def game_manifest_url():
@@ -1854,7 +1854,7 @@ class LauncherUI:
                 from curl_cffi import requests as curl_requests
                 for attempt in range(2):
                     try:
-                        response = curl_requests.get('https://api.github.com/repos/cputroll/sable-loop/releases/latest', headers={'User-Agent':'sable-loop', 'Accept':'application/vnd.github+json'}, timeout=(10, 60))
+                        response = curl_requests.get('https://api.github.com/repos/GhostDMA/sable-loop/releases/latest', headers={'User-Agent':'sable-loop', 'Accept':'application/vnd.github+json'}, timeout=(10, 60))
                         try:
                             response.raise_for_status()
                             release = response.json()
