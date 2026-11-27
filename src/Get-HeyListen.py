@@ -65,7 +65,7 @@ except ImportError:
     sys.exit("Missing dependency. Run:  python -m pip install curl_cffi")
 
 HERE = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
-APP_VERSION = "1.8.1"
+APP_VERSION = "1.0.0"
 MAX_UPDATE_BYTES = 150 * 1024 * 1024
 MANIFEST_LOCAL = HERE / "sources.json"
 MANIFEST_CACHE = HERE / "sources.cache.json"
@@ -1248,6 +1248,10 @@ def parallel_download(session_factory, url, dest, size, expected_sha, progress, 
     """Download into disjoint offsets; only fully completed regions are resumable."""
     part = Path(str(dest) + '.part')
     side = Path(str(dest) + '.part.json')
+    if not side.exists() and part.is_file() and 0 < part.stat().st_size < size:
+        retry_hook = {'on_retry': on_retry} if on_retry is not None else {}
+        stream_to(session_factory(), url, dest, expect=size, progress=progress.add, quiet=True, **retry_hook)
+        return
     state = chunk_state(dest, size, streams, chunk_min)
     bounds = state['bounds']
     completed = sum(b - a for (a, b), done in zip(bounds, state['done']) if done)
@@ -2181,9 +2185,9 @@ def restore_segment_checkpoint(temp, checkpoint, item):
         if type(index) is not int or not 0 < index < len(item['segments']):
             raise ValueError('invalid checkpoint index')
         size = sum(part['length'] for part in item['segments'][:index])
-        if type(info['bytes_written']) is not int or info['bytes_written'] != size or temp.stat().st_size != size:
+        if type(info['bytes_written']) is not int or info['bytes_written'] != size or temp.stat().st_size < size:
             raise ValueError('invalid checkpoint length')
-        with temp.open('rb') as source:
+        with temp.open('r+b') as source:
             for part in item['segments'][:index]:
                 segment_hash = hashlib.sha256()
                 remaining = part['length']
@@ -2195,8 +2199,10 @@ def restore_segment_checkpoint(temp, checkpoint, item):
                     segment_hash.update(data); hasher.update(data); remaining -= len(data)
                 if segment_hash.hexdigest() != part['sha256']:
                     raise ValueError('checkpoint hash mismatch')
+            if os.fstat(source.fileno()).st_size > size:
+                source.truncate(size)  # Interrupted after the last committed segment.
         return index, hasher
-    except (OSError, ValueError, KeyError, TypeError):
+    except (FileNotFoundError, ValueError, KeyError, TypeError):
         pass
     # Retry cleanup after leaving the handler so an expected invalid or missing
     # checkpoint is not attached to a subsequent, recoverable file-lock error.
@@ -2258,14 +2264,14 @@ def assemble_segmented(pending, assets, cache, root, fetch, keep_assets, soft_re
             log(f"Preparing download: {count - 1}/{len(pending)} destination files checked", echo=True)
             last_report = now
         relative = item['path']
-        parts = _game_path_parts(root, relative) if soft_retry else relative.split('/')
+        parts = _game_path_parts(root, relative)
         target = root.joinpath(*parts)
         direct = False  # Always stage so cancellation cannot truncate a final target.
         state = {'item': item, 'target': target,
                  'temp': target if direct else _game_staging_path(target),
                  'direct': direct, 'next': 0, 'started': False, 'complete': False,
                  'hasher': hashlib.sha256(), 'lock': threading.Lock()}
-        if soft_retry and not direct:
+        if not direct:
             parent_key = relative.rpartition('/')[0]
             if parent_key not in parents_needing_checks:
                 parents_needing_checks[parent_key] = _parent_needs_segment_checks(root, parts[:-1], relative)
@@ -2445,33 +2451,18 @@ def assemble_segmented(pending, assets, cache, root, fetch, keep_assets, soft_re
         for thread in workers:
             thread.join()
     if shared['error']:
-        soft = soft_retry is True and isinstance(shared['error'], SegmentMismatch)
         for state in states:
             if state['started'] and not state['complete']:
                 checkpoint = Path(str(state['temp']) + '.json')
-                if soft and not state['direct'] and checkpoint.exists():
-                    try:
-                        if _leftover_kind(state['temp']) != 'plain':
-                            # Revalidate at use: only a plain file this run
-                            # verified may be truncated, never a swapped link.
-                            raise ValueError('staging file was replaced')
-                        length = json.loads(checkpoint.read_text(encoding='utf-8'))['bytes_written']
-                        with state['temp'].open('r+b') as output:
-                            output.truncate(length)
-                    except (OSError, ValueError, KeyError, TypeError):
-                        state['temp'].unlink(missing_ok=True)
-                        checkpoint.unlink(missing_ok=True)
-                else:
+                if not checkpoint.exists():
                     state['temp'].unlink(missing_ok=True)
-                    checkpoint.unlink(missing_ok=True)
-        for name in ([shared['error'].asset] if soft else names):
-            for suffix in ('', '.part', '.part.json'):
-                Path(str(cache / name) + suffix).unlink(missing_ok=True)
+        # fetch re-hashes cached bundles and chunk_state re-hashes completed
+        # ranges on resume. A transfer failure says nothing about either.
         raise shared['error']
 
 
 def running_launcher_paths():
-    """Return accessible running executable paths, conservatively protecting them all."""
+    """Return process images so the planner can report in-use game files."""
     paths = {Path(sys.executable).resolve()}
     if os.name != 'nt':
         return paths
@@ -2590,6 +2581,7 @@ def _plan_game_files_native(root: Path, files: list, running: set, workers: int 
                     return None  # The native inventory deliberately does not inspect these trees.
             running = {os.path.normcase(str(p)) for p in running}
             running_names = {os.path.basename(p).casefold() for p in running}
+            launcher = os.path.normcase(str(Path(sys.executable).resolve()))
             to_hash = []
             for count, item in enumerate(files, 1):
                 relative = item['path']
@@ -2597,9 +2589,14 @@ def _plan_game_files_native(root: Path, files: list, running: set, workers: int 
                     return None
                 if running and relative.rpartition('/')[2].casefold() in running_names:
                     _, resolved = _checked_game_paths(root, relative)
-                    if os.path.normcase(str(resolved)) in running:
+                    image = os.path.normcase(str(resolved))
+                    if image == launcher:
                         log('launcher executable left in place; the launcher updates itself separately')
                         skipped.add(relative)
+                        continue
+                    if image in running:
+                        log(f'Update pending: close the running game file {relative}', echo=True)
+                        fetch.add(relative)
                         continue
                 entry = inventory.get(relative)
                 if entry is None or entry[0] != item['size']:
@@ -2650,7 +2647,8 @@ def plan_game_files(root: Path, files: list, workers: int = 32):
     kept = 0
     missing_plan_parents = {}
     running = {os.path.normcase(str(p.resolve())) for p in running_launcher_paths()}
-    running.add(os.path.normcase(str(Path(sys.executable).resolve())))
+    launcher = os.path.normcase(str(Path(sys.executable).resolve()))
+    running.add(launcher)
     native = _plan_game_files_native(root, files, running, workers)
     if native is not None:
         return native
@@ -2669,14 +2667,23 @@ def plan_game_files(root: Path, files: list, workers: int = 32):
             target, resolved_target = _checked_game_paths(root, relative)
         else:
             resolved_target = missing_parent / parts[-1]
-        if os.path.normcase(str(resolved_target)) in running:
+        image = os.path.normcase(str(resolved_target))
+        if image == launcher:
             log('launcher executable left in place; the launcher updates itself separately')
             return 'launcher'
+        if image in running:
+            log(f'Update pending: close the running game file {relative}', echo=True)
+            return 'fetch'
         if missing_parent is None and inventory.get(relative) == item['size']:
             if item['size'] >= 256 * 1024 * 1024:
                 log(f"Checking SHA-256: {item['path']} ({human(item['size'])})")
-            if sha256(target, progress=item['size'] >= 256 * 1024 * 1024) == item['sha256']:
-                return 'keep'
+            try:
+                if sha256(target, progress=item['size'] >= 256 * 1024 * 1024) == item['sha256']:
+                    return 'keep'
+            except OSError as exc:
+                if not isinstance(exc, PermissionError) and getattr(exc, 'winerror', None) not in (32, 33):
+                    raise
+                log(f'Update pending: cannot read {relative}: {exc}', echo=True)
         return 'fetch'
 
     last_report = time.monotonic()
@@ -2742,7 +2749,7 @@ def install_game(s, man: dict, root: Path, dry_run: bool = False, prune: bool = 
         # Count the entire asset: sparse/preallocated chunks may consume space
         # later, and a server may discard a partial when it ignores ranges.
         uncached_asset_sizes.append(part['size'])
-        if part['size'] >= PARALLEL_THRESHOLD and download_streams() > 1:
+        if part['size'] >= PARALLEL_THRESHOLD and download_streams() > 1 and Path(str(partial) + '.json').exists():
             state = chunk_state(cached, part['size'], download_streams())
             have = sum(b - a for (a, b), done in zip(state['bounds'], state['done']) if done)
         else:
