@@ -1458,6 +1458,7 @@ SURFACE_FOCUS = (52, 61, 72)
 DANGER = (240, 128, 112)
 SUCCESS = (120, 204, 150)
 TYPE = {'display': ('segoeuib.ttf', 64), 'title': ('seguisb.ttf', 36), 'figure': ('segoeuil.ttf', 56),
+        'install_title': ('seguisb.ttf', 44),
         'heading': ('seguisb.ttf', 22), 'body': ('segoeui.ttf', 20), 'button': ('seguisb.ttf', 20),
         'cta': ('segoeuib.ttf', 24), 'caption': ('segoeui.ttf', 16), 'overline': ('seguisb.ttf', 14)}
 MARGIN = 96
@@ -2338,6 +2339,7 @@ class LauncherUI:
                             self.progress = phase
                             self.progress_info = {'game_detail': game_progress_detail(value)}
                             if value.get('phase') == 'Downloading':
+                                self.progress_info.update(done=value.get('done'), total=value.get('total'))
                                 received = value.get('rate_received_at')
                                 self.progress_info['game_detail_until'] = (
                                     time.monotonic() if received is None else received) + GAME_RATE_TIMEOUT
@@ -2491,11 +2493,11 @@ class LauncherUI:
             return 'Game folder', str(self.folder), None
         return label, None, None
 
-    def draw_rows(self, p, labels, x, y, w, h, gap, dt, first=0):
+    def draw_rows(self, p, labels, x, y, w, h, gap, dt, first=0, quiet=False):
         """Stacked rows with independent focus and hover; registers mouse targets."""
         for i, _ in enumerate(labels):
             hovered = getattr(self, 'hover', None) == first + i
-            p.fill(x, y + i * (h + gap), w, h, SURFACE_FOCUS if hovered else SURFACE_HI, 220 if hovered else 165, 10)
+            p.fill(x, y + i * (h + gap), w, h, SURFACE_FOCUS if hovered else SURFACE_HI, 220 if hovered else (78 if quiet else 165), 10)
         if first <= self.focus < first + len(labels):
             fy = y + (self.focus - first) * (h + gap)
             p.fill(x, fy, w, h, SURFACE_FOCUS, 255, 10)
@@ -2518,6 +2520,14 @@ class LauncherUI:
                 p.text('caption', fitted, right, top + (h - p.height('caption')) // 2, INK_DIM, align='right')
                 right -= p.measure('caption', fitted)[0] + 24
             p.text('button', text, x + 20, top + (h - p.height('button')) // 2, INK if focused else (210, 215, 221), max_width=right - x - 20)
+
+    def draw_primary(self, p, label, index, x, y, w, h, role='button'):
+        self.hits.append((x, y, w, h, index))
+        hovered = getattr(self, 'hover', None) == index
+        p.fill(x, y, w, h, ACCENT, 220 if hovered and self.focus != index else 255, 12)
+        if self.focus == index:
+            p.ring(x - FOCUS_GAP, y - FOCUS_GAP, w + 2 * FOCUS_GAP, h + 2 * FOCUS_GAP, ACCENT, 225, 12 + FOCUS_GAP, 2)
+        p.text(role, label, x + w // 2, y + (h - p.height(role)) // 2, ACCENT_INK, max_width=w - 32, align='center')
 
     def draw_hints(self, p, items):
         x, y = MARGIN, 672
@@ -2564,17 +2574,13 @@ class LauncherUI:
             subtitle = 'Installed and ready to play.'
         else:
             subtitle = 'Not installed yet.'
-        p.text('body', subtitle, x, 270, INK_DIM, max_width=620)
+        p.text('body', subtitle, x, 264, INK_DIM, max_width=620)
         buttons = self.buttons()
         cta = {'Play': 'PLAY', 'Download': 'DOWNLOAD', 'Update now': 'UPDATE NOW'}.get(buttons[0]) if buttons else None
-        top, w = 336, 340
+        top, w = 336, 352
         if cta:
-            h = 68
-            self.hits.append((x, top, w, h, 0))
-            p.fill(x, top, w, h, ACCENT, 210 if getattr(self, 'hover', None) == 0 and self.focus != 0 else 255, 12)
-            if self.focus == 0:
-                p.ring(x - FOCUS_GAP, top - FOCUS_GAP, w + 2 * FOCUS_GAP, h + 2 * FOCUS_GAP, ACCENT, 220, 11 + FOCUS_GAP, 2)
-            p.text('cta', cta, x + w // 2, top + (h - p.height('cta')) // 2, ACCENT_INK, max_width=w - 40, align='center')
+            h = 72
+            self.draw_primary(p, cta, 0, x, top, w, h, 'cta')
             rows, first = buttons[1:], 1
         else:
             h = 68
@@ -2585,7 +2591,7 @@ class LauncherUI:
                 rows, first = buttons[1:], 1
             else:
                 rows, first = buttons, 0
-        self.draw_rows(p, rows, x, top + h + 22, w, 50, 10, dt, first)
+        self.draw_rows(p, rows, x, top + h + 24, w, 48, 8, dt, first, quiet=True)
         p.circle(x + 5, 626 + p.height('caption') // 2, 4, self.status_tone())
         p.text('caption', self.status, x + 18, 626, INK_DIM, max_width=700)
         self.draw_hints(p, [('A / ENTER', 'Select'), ('START / F1', 'Settings')])
@@ -2593,7 +2599,7 @@ class LauncherUI:
 
     def draw_progress(self, p, dt):
         p.scene(scrim=150)
-        x, bar_w = MARGIN, 780
+        x, bar_w = MARGIN, 848
         info = self.progress_info or {}
         tool = self.operation == 'tool'
         game = self.operation in GAME_OPERATIONS
@@ -2603,45 +2609,46 @@ class LauncherUI:
             match = re.search(r'(\d{1,3})%', self.progress)
             pct = min(100, int(match.group(1))) if match else None
         phase = (self.progress or 'Preparing') if game else (info.get('phase') or ('Preparing' if pct is None else 'Downloading'))
-        p.text('overline', phase.upper(), x + 2, 124, ACCENT, max_width=bar_w)
-        p.text('title', title, x, 142, INK, max_width=bar_w)
+        p.text('install_title', title, x, 136, INK, max_width=bar_w)
+        p.circle(x + 4, 216 + p.height('body') // 2, 4, SUCCESS if pct == 100 else ACCENT)
+        p.text('body', phase, x + 20, 216, INK_DIM, max_width=bar_w - 20)
         if game and pct == 0 and phase == 'Checking existing files':
-            p.text('body', 'Checking files already on this PC…', x, 250, INK_DIM, max_width=bar_w)
+            p.text('caption', 'Checking files already on this PC…', x, 288, INK_DIM, max_width=bar_w)
         elif pct is not None:
-            p.text('figure', f'{pct}%', x - 2, 204, INK)
+            p.text('heading', f'{pct}%', x, 280, INK)
         else:
             body = 'Please wait — this usually takes under a minute.' if tool else (self.progress or 'Getting things ready…')
-            p.text('body', body, x, 250, INK_DIM, max_width=bar_w)
-        p.fill(x, 300, bar_w, 12, (255, 255, 255), 30, 6)
+            p.text('caption', body, x, 288, INK_DIM, max_width=bar_w)
+        p.fill(x, 328, bar_w, 6, INK, 42, 3)
         if pct is not None:
             target = bar_w * max(0, min(100, pct)) / 100
-            fill = target if game and pct == 100 else self.ease('game_bar' if game else 'bar', target, dt, rate=.12)
-            if fill >= 12:
-                p.fill(x, 300, fill, 12, ACCENT, 255, 6)
+            fill = self.ease('game_bar' if game else 'bar', target, 0 if self.reduce_motion else dt, rate=.08)
+            p.fill(x, 328, fill, 6, ACCENT, 255, 3)
         else:
-            phase_t = (time.monotonic() * .6) % 1
+            phase_t = .5 if self.reduce_motion else (time.monotonic() * .6) % 1
             seg = 180
             start = -seg + phase_t * (bar_w + seg)
             left, right = max(x, x + start), min(x + bar_w, x + start + seg)
             if right - left >= 12:
-                p.fill(left, 300, right - left, 12, ACCENT, 255, 6)
+                p.fill(left, 328, right - left, 6, ACCENT, 255, 3)
         done, total, speed = info.get('done'), info.get('total'), info.get('speed') or 0
         if (game and info.get('game_detail') and pct != 100
                 and ('game_detail_until' not in info or time.monotonic() < info['game_detail_until'])):
-            p.text('body', info['game_detail'], x, 326, INK_DIM, max_width=bar_w)
+            p.text('caption', info['game_detail'], x + bar_w, 352, INK_DIM, max_width=bar_w, align='right')
+        if total and done is not None and (not game or pct != 100):
+            p.text('caption', f'{fmt_bytes(done)} of {fmt_bytes(total)}', x + bar_w, 288, INK, align='right')
         if not game and total:
-            p.text('body', f'{fmt_bytes(done)} of {fmt_bytes(total)}', x, 326, INK)
             right = (fmt_bytes(speed) + '/s') if speed else ''
             if speed and total > done:
                 right += ('  ·  ' if right else '') + fmt_eta((total - done) / speed) + ' left'
             if right:
-                p.text('body', right, x + bar_w, 326, INK_DIM, align='right')
+                p.text('caption', right, x + bar_w, 352, INK_DIM, align='right')
         if not game and (pct is not None or tool):
             detail = self.progress if not tool else "The launcher restarts by itself when it's done."
-            p.text('caption', detail, x, 364, INK_FAINT, max_width=bar_w, middle=True)
+            p.text('caption', detail, x, 392, INK_FAINT, max_width=bar_w, middle=True)
         buttons = self.buttons()
         if buttons:
-            self.draw_rows(p, buttons, x, 420, 240, 50, 10, dt)
+            self.draw_rows(p, buttons, x, 464, 216, 48, 8, dt, quiet=True)
             self.draw_hints(p, [('A / ENTER', 'Select'), ('B / ESC', 'Cancel')])
         else:
             self.draw_hints(p, [])
@@ -2664,18 +2671,39 @@ class LauncherUI:
             self.draw_rows(p, buttons[first:first + visible], x, top, w, 52, 8, dt, first=first)
             p.text('caption', self.free_space_text(), x, 604, INK_FAINT, max_width=w)
         elif self.screen == 'folder':
-            p.fill(x, top, w, 66, SURFACE_HI, 200, 10)
-            p.text('overline', 'INSTALL LOCATION', x + 20, top + 10, INK_DIM)
-            p.text('body', str(self.folder), x + 20, top + 30, INK, max_width=w - 40, middle=True)
-            p.text('caption', self.free_space_text(), x, top + 78, INK_FAINT, max_width=w)
-            self.draw_rows(p, buttons, x, top + 120, 420, 50, 10, dt)
+            p.text('overline', 'INSTALL LOCATION', x, 168, INK_DIM)
+            p.text('body', str(self.folder), x, 192, INK, max_width=w, middle=True)
+            choices = [label for label in buttons if label in ('Use existing folder', 'Use default folder')]
+            card_w = (w - 16) // 2 if len(choices) == 2 else w
+            for col, label in enumerate(choices):
+                idx, cx = buttons.index(label), x + col * (card_w + 16)
+                existing = label == 'Use existing folder'
+                default = self.fallback if self.folder == self.fallback else self.primary
+                path = self.legacy if existing else default
+                selected = self.folder == path
+                focused = self.focus == idx
+                self.hits.append((cx, 240, card_w, 104, idx))
+                p.fill(cx, 240, card_w, 104, SURFACE_FOCUS if focused or self.hover == idx else SURFACE_HI, 235, 12)
+                if focused:
+                    p.ring(cx - FOCUS_GAP, 240 - FOCUS_GAP, card_w + 2 * FOCUS_GAP, 104 + 2 * FOCUS_GAP, ACCENT, 230, 12 + FOCUS_GAP, 2)
+                p.circle(cx + 24, 266, 7, ACCENT if selected else INK_DIM)
+                if not selected:
+                    p.circle(cx + 24, 266, 5, SURFACE_HI)
+                p.text('button', label, cx + 44, 252, INK, max_width=card_w - 60)
+                p.text('caption', 'Reuse the files already here.' if existing else 'Install in the recommended location.', cx + 44, 282, INK_DIM, max_width=card_w - 60)
+                p.text('caption', str(path), cx + 44, 310, INK_DIM, max_width=card_w - 60, middle=True)
+            self.draw_rows(p, ['Choose another folder'], x, 360, 272, 48, 8, dt, buttons.index('Choose another folder'), quiet=True)
+            p.text('caption', self.free_space_text(), x, 432, INK_DIM, max_width=w)
+            self.draw_primary(p, 'Continue', buttons.index('Continue'), x, 488, 240, 56)
+            if 'Update now' in buttons:
+                self.draw_rows(p, ['Update now'], x + 264, 488, 192, 56, 8, dt, buttons.index('Update now'), quiet=True)
         elif self.screen == 'error':
-            lines = p.wrap('body', self.last_error or 'An unknown error occurred.', w - 24, 4)
-            p.fill(x, top, 4, len(lines) * 30 - 2, DANGER, 255, 2)
+            lines = p.wrap('body', self.last_error or 'An unknown error occurred.', w, 2)
             for i, line in enumerate(lines):
-                p.text('body', line, x + 20, top + i * 30, INK)
-            p.text('caption', 'Details are in the log.', x + 20, top + len(lines) * 30 + 6, INK_FAINT)
-            self.draw_rows(p, buttons, x, top + len(lines) * 30 + 50, 320, 50, 10, dt)
+                p.text('body', line, x, top + i * 32, INK_DIM)
+            p.text('caption', 'Details are in the log.', x, top + len(lines) * 32 + 16, INK_DIM)
+            self.draw_primary(p, buttons[0], 0, x, 336, 240, 56)
+            self.draw_rows(p, buttons[1:], x, 416, 240, 48, 8, dt, first=1, quiet=True)
         else:
             p.text('body', 'Only changed files are downloaded. Your saves are not touched.', x, top, INK_DIM, max_width=w)
             self.draw_rows(p, buttons, x, top + 56, 320, 50, 10, dt)
@@ -2844,6 +2872,13 @@ class LauncherUI:
             label = 'Quit game'
             p.text('caption', label, left + (width - p.measure('caption', label)[0]) // 2,
                    top + (height - p.height('caption')) // 2, INK)
+        if getattr(self, '_drawn_screen', self.screen) != self.screen:
+            self._reveal_left = .24
+        self._drawn_screen = self.screen
+        left = max(0, getattr(self, '_reveal_left', 0) - dt)
+        self._reveal_left = left
+        if left and not getattr(self, 'snap', False) and not self.reduce_motion:
+            p.fill(0, 0, *CANVAS, SURFACE, int(88 * (left / .24) ** 2))
 
     def screenshot_scenes(self):
         """Realistic fake states for the --screenshot design/regression loop."""
@@ -2868,7 +2903,7 @@ class LauncherUI:
             scene('playing', 'main', State.PLAYING, 'Playing...'),
             scene('hero-download', 'main', State.NOT_INSTALLED, 'Game data: 2026.11.16', folder=long),
             scene('progress', 'progress', State.DOWNLOADING, operation='download', _game_progress_pct=63,
-                  progress='Downloading game files', progress_info={'game_detail': game_progress_detail(
+                  progress='Downloading game files', progress_info={'done': 19300000000, 'total': 30871262365, 'game_detail': game_progress_detail(
                       {'phase': 'Downloading', 'speed': 23218411, 'done': 19300000000, 'total': 30871262365})}),
             scene('tool-update', 'progress', State.READY, operation='tool', progress_info={}, progress='Updating sable-loop…'),
             scene('settings', 'settings', State.READY, 'sable-loop is up to date.', focus=2, folder=long),
