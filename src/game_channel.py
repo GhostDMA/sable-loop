@@ -1,0 +1,171 @@
+"""Resolve the atomic game channel to a verified immutable release asset."""
+import hashlib
+import json
+import re
+import os
+import tempfile
+import time
+from contextlib import contextmanager
+from pathlib import Path
+
+CHANNEL_URL = 'https://raw.githubusercontent.com/cputroll/sable-loop/game-channel/channel.json'
+ASSET_BASE = 'https://github.com/cputroll/sable-loop/releases/download/game-v1/'
+LEGACY_URL = ASSET_BASE + 'game-manifest.json'
+
+
+class LockTimeout(TimeoutError):
+    """An install or channel lock remained held beyond its deadline."""
+
+
+class CorruptState(ValueError):
+    """Saved channel state cannot be trusted."""
+
+
+class ChecksumMismatch(ValueError):
+    """Channel content did not match its verified digest."""
+
+
+def load_state(folder):
+    path = Path(folder) / '.heylisten-get' / 'channel-state.json'
+    try:
+        state = json.loads(path.read_text(encoding='utf-8'))
+    except FileNotFoundError:
+        return 0, None
+    except (ValueError, UnicodeError) as exc:
+        raise CorruptState('invalid saved game channel state') from exc
+    try:
+        revision, digest = state['revision'], state['sha256']
+    except (KeyError, TypeError) as exc:
+        raise CorruptState('invalid saved game channel state') from exc
+    if type(revision) is not int or revision < 1 or not isinstance(digest, str) or not re.fullmatch(r'[0-9a-f]{64}', digest):
+        raise CorruptState('invalid saved game channel state')
+    return revision, digest
+
+
+@contextmanager
+def state_lock(directory, timeout=10, name='channel-state.lock', check_cancel=None):
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / name).open('a+b') as lock:
+        lock.seek(0, os.SEEK_END)
+        if lock.tell() == 0:
+            lock.write(b'0')
+            lock.flush()
+        deadline = time.monotonic() + timeout
+        while True:
+            if check_cancel:
+                check_cancel()
+            try:
+                lock.seek(0)
+                if os.name == 'nt':
+                    import msvcrt
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if time.monotonic() >= deadline:
+                    raise LockTimeout('game channel state lock timed out') from exc
+                time.sleep(.05)
+        try:
+            yield
+        finally:
+            lock.seek(0)
+            if os.name == 'nt':
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def install_lock(folder, timeout=10, check_cancel=None):
+    return state_lock(Path(folder) / '.heylisten-get', timeout, name='install-operation.lock', check_cancel=check_cancel)
+
+
+def save_state(folder, revision, digest):
+    if type(revision) is not int or revision < 1 or not isinstance(digest, str) or not re.fullmatch(r'[0-9a-f]{64}', digest):
+        raise ValueError('invalid game channel state')
+    directory = Path(folder) / '.heylisten-get'
+    with state_lock(directory):
+        old_revision, old_digest = load_state(folder)
+        if revision < old_revision or (revision == old_revision and digest != old_digest):
+            raise ValueError('game channel state would regress')
+        fd, temporary = tempfile.mkstemp(dir=directory, prefix='channel-', suffix='.tmp')
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as out:
+                json.dump({'revision': revision, 'sha256': digest}, out)
+            os.replace(temporary, directory / 'channel-state.json')
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+
+class StaleChannel(ValueError):
+    """The channel is older than a previously verified revision."""
+
+
+def resolve_info(fetch, minimum_revision=0, expected_digest=None, pointer_data=None):
+    pointer = json.loads(fetch(CHANNEL_URL) if pointer_data is None else pointer_data)
+    revision = pointer.get('revision', 0)
+    if type(revision) is not int or revision < 1:
+        raise ValueError('invalid game channel revision')
+    if revision < minimum_revision:
+        raise StaleChannel('stale game channel')
+    name = pointer.get('manifest')
+    digest = pointer.get('sha256')
+    if (pointer.get('version') != 1 or not isinstance(name, str)
+            or not re.fullmatch(r'game-manifest-[A-Za-z0-9._-]+\.json', name)
+            or not isinstance(digest, str) or not re.fullmatch(r'[0-9a-f]{64}', digest)):
+        raise ValueError('invalid game channel')
+    if revision == minimum_revision and expected_digest is not None and digest != expected_digest:
+        raise ValueError('game channel revision changed content')
+    data = fetch(ASSET_BASE + name)
+    if hashlib.sha256(data).hexdigest() != digest:
+        raise ChecksumMismatch('game channel manifest checksum mismatch')
+    return data, revision, digest
+
+
+def resolve(fetch, minimum_revision=0, expected_digest=None, pointer_data=None):
+    return resolve_info(fetch, minimum_revision, expected_digest, pointer_data)[0]
+
+
+def fetch_bytes(session, url, max_bytes=None):
+    limit = max_bytes if max_bytes is not None else (16384 if url == CHANNEL_URL else 128 * 1024 * 1024)
+    response = session.get(url, stream=True, timeout=(10, 30))
+    try:
+        if response.status_code == 404:
+            raise FileNotFoundError('channel resource not found')
+        response.raise_for_status()
+        chunks = []
+        total = 0
+        for chunk in response.iter_content(chunk_size=1024 * 1024):
+            total += len(chunk)
+            if total > limit:
+                raise ValueError('channel response exceeds size limit')
+            chunks.append(chunk)
+        return b''.join(chunks)
+    finally:
+        response.close()
+
+
+def fetch_for_folder(folder, fetch, validate, legacy_url=LEGACY_URL):
+    minimum_revision, expected_digest = load_state(folder)
+    try:
+        pointer = fetch(CHANNEL_URL)
+    except FileNotFoundError:
+        if minimum_revision:
+            raise
+        return validate(fetch(legacy_url))
+    data, revision, digest = resolve_info(fetch, minimum_revision, expected_digest, pointer)
+    result = validate(data)
+    save_state(folder, revision, digest)
+    return result
+
+
+def resolve_with_fallback(fetch, minimum_revision=0, expected_digest=None):
+    try:
+        pointer = fetch(CHANNEL_URL)
+    except FileNotFoundError:
+        if minimum_revision:
+            raise
+        return fetch(LEGACY_URL)
+    return resolve(fetch, minimum_revision, expected_digest, pointer)

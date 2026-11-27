@@ -1,0 +1,3110 @@
+"""Headless launcher state model; UI integration is not yet implemented."""
+from enum import Enum, auto
+import queue
+import threading
+import argparse
+import ctypes
+import json
+import math
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import parent_identity
+import qa_pause
+import sys
+import time
+import traceback
+import urllib.request
+import hashlib
+import base64
+try:
+    import winreg
+except ImportError:
+    winreg = None
+import game_settings
+import game_state
+import hint_motion
+from quit_control import top_right
+from window_state import WindowController
+from update_resources import resolve_update_script
+try:
+    import build_flags
+except ModuleNotFoundError as exc:
+    if exc.name != 'build_flags' or getattr(sys, 'frozen', False):
+        raise
+    from types import SimpleNamespace
+    build_flags = SimpleNamespace(QA_SEAMS=True)
+
+
+def _qa_pause(name):
+    qa_pause.pause(name, build_flags.QA_SEAMS)
+
+
+ROOT = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
+BASE = Path(sys.executable).resolve().parent if getattr(sys, 'frozen', False) else Path(__file__).resolve().parent
+STATE_DIR = Path(os.environ.get('LOCALAPPDATA', str(Path.home()))) / 'sable-loop'
+CONFIG = STATE_DIR / 'launcher.json'
+LOG = STATE_DIR / 'launcher.log'
+# Test-only isolation overrides, read once: registry parent under HKCU, shortcut directories,
+# a local game manifest, and guarded dummy-video GUI installation automation.
+# QA builds also support SILVER_LANTERN_PAUSE_AT, SILVER_LANTERN_PAUSE_READY,
+# and SILVER_LANTERN_PAUSE_RELEASE for deterministic checkpoint tests.
+# Empty/unset values preserve normal registration, known folders, and game channel behavior.
+_TEST_REG_ROOT = os.environ.get('SILVER_LANTERN_REG_ROOT') or r'Software\Microsoft\Windows\CurrentVersion\Uninstall'
+_TEST_DESKTOP_DIR = os.environ.get('SILVER_LANTERN_DESKTOP_DIR') or None
+_TEST_STARTMENU_DIR = os.environ.get('SILVER_LANTERN_STARTMENU_DIR') or None
+_TEST_GAME_MANIFEST = (os.environ.get('SILVER_LANTERN_GAME_MANIFEST') or None) if build_flags.QA_SEAMS else None
+_TEST_GUI_INSTALL = os.environ.get('SILVER_LANTERN_TEST_GUI_INSTALL') == '1'
+_TEST_VIDEO_DRIVER = os.environ.get('SDL_VIDEODRIVER')
+
+
+def _test_gui_install_enabled():
+    return _TEST_GUI_INSTALL and _TEST_VIDEO_DRIVER == 'dummy' and bool(_TEST_GAME_MANIFEST)
+
+GAME_NAME = 'Star Wars: Galactic Racer'
+MANIFEST_URL = 'https://github.com/cputroll/sable-loop/releases/download/game-v1/game-manifest.json'
+
+
+def game_manifest_url():
+    try:
+        value = json.loads((BASE / 'sources.json').read_text(encoding='utf-8-sig')).get('game', {}).get('game_manifest_url')
+        if isinstance(value, str) and value.startswith('https://'):
+            return value
+    except (OSError, ValueError, AttributeError):
+        pass
+    return MANIFEST_URL
+
+
+APP_VERSION = getattr(sys.modules.get('__main__'), 'APP_VERSION', '1.8.1')
+
+
+def play_tip_parts(folder):
+    try:
+        shortcut = game_settings.read_values(folder)['menu_shortcut']
+        keys = {0: 'F1 or Insert', 1: 'Insert', 2: 'F1'}.get(shortcut)
+    except OSError:
+        keys = None
+    if keys:
+        return 'While playing, press ', keys, ' for settings or to quit.'
+    return 'While playing, open the game menu for settings or to quit.', '', ''
+
+
+def play_tip(folder):
+    return ''.join(play_tip_parts(folder))
+
+
+class MenuCombo:
+    def __init__(self):
+        self.started = None
+        self.fired = False
+
+    def update(self, start, back, now):
+        if not (start and back):
+            self.started, self.fired = None, False
+        elif self.started is None:
+            self.started = now
+        elif not self.fired and now - self.started >= 2:
+            self.fired = True
+            return True
+        return False
+
+
+def menu_combo_key(folder):
+    return 0x70 if game_settings.read_values(folder).get('menu_shortcut', 0) == 2 else 0x2d
+
+
+def game_is_foreground(pid):
+    user32 = ctypes.windll.user32
+    user32.GetForegroundWindow.restype = ctypes.c_void_p
+    hwnd = user32.GetForegroundWindow()
+    owner = ctypes.c_ulong()
+    if hwnd:
+        user32.GetWindowThreadProcessId(ctypes.c_void_p(hwnd), ctypes.byref(owner))
+    return bool(hwnd and owner.value == pid)
+
+
+def send_menu_key(pid, key):
+    from ctypes import wintypes
+    class KEYBDINPUT(ctypes.Structure):
+        _fields_ = [('wVk', wintypes.WORD), ('wScan', wintypes.WORD), ('dwFlags', wintypes.DWORD), ('time', wintypes.DWORD), ('dwExtraInfo', ctypes.c_size_t)]
+    class MOUSEINPUT(ctypes.Structure):
+        _fields_ = [('dx', wintypes.LONG), ('dy', wintypes.LONG), ('mouseData', wintypes.DWORD), ('dwFlags', wintypes.DWORD), ('time', wintypes.DWORD), ('dwExtraInfo', ctypes.c_size_t)]
+    class HARDWAREINPUT(ctypes.Structure):
+        _fields_ = [('uMsg', wintypes.DWORD), ('wParamL', wintypes.WORD), ('wParamH', wintypes.WORD)]
+    class INPUT_UNION(ctypes.Union):
+        _fields_ = [('ki', KEYBDINPUT), ('mi', MOUSEINPUT), ('hi', HARDWAREINPUT)]
+    class INPUT(ctypes.Structure):
+        _fields_ = [('type', wintypes.DWORD), ('data', INPUT_UNION)]
+    if not game_is_foreground(pid):
+        return
+    inputs = (INPUT * 2)(INPUT(1, INPUT_UNION(ki=KEYBDINPUT(key, 0, 0, 0, 0))), INPUT(1, INPUT_UNION(ki=KEYBDINPUT(key, 0, 2, 0, 0))))
+    if ctypes.windll.user32.SendInput(2, inputs, ctypes.sizeof(INPUT)) != 2:
+        raise OSError('SendInput failed')
+
+
+class ComboWatcher:
+    def __init__(self, process, folder):
+        self.process, self.folder, self.holds = process, folder, {}
+
+    def tick(self, buttons, now):
+        try:
+            if self.process.poll() is not None:
+                return False
+            if not game_is_foreground(self.process.pid):
+                self.holds.clear()
+                return True
+            self.holds = {ident: self.holds.get(ident, MenuCombo()) for ident in buttons}
+            for ident, (start, back) in buttons.items():
+                if self.holds[ident].update(start, back, now):
+                    send_menu_key(self.process.pid, menu_combo_key(self.folder))
+            return True
+        except Exception as exc:
+            log_message(f'Controller menu watcher: {exc}')
+            return False
+
+
+class XInputGamepad(ctypes.Structure):
+    _fields_ = [('wButtons', ctypes.c_ushort), ('bLeftTrigger', ctypes.c_ubyte), ('bRightTrigger', ctypes.c_ubyte), ('sThumbLX', ctypes.c_short), ('sThumbLY', ctypes.c_short), ('sThumbRX', ctypes.c_short), ('sThumbRY', ctypes.c_short)]
+
+
+class XInputState(ctypes.Structure):
+    _fields_ = [('dwPacketNumber', ctypes.c_uint32), ('Gamepad', XInputGamepad)]
+
+
+def load_xinput():
+    for dll in ('xinput1_4', 'xinput1_3', 'xinput9_1_0'):
+        try:
+            get_state = ctypes.WinDLL(dll).XInputGetState
+            get_state.argtypes = (ctypes.c_uint32, ctypes.POINTER(XInputState))
+            get_state.restype = ctypes.c_uint32
+            return get_state
+        except (OSError, AttributeError):
+            continue
+    raise OSError('XInput unavailable')
+
+
+def watch_controller_combo(process, folder):
+    try:
+        get_state = load_xinput()
+        watcher = ComboWatcher(process, folder)
+        while process.poll() is None:
+            buttons = {}
+            for index in range(4):
+                state = XInputState()
+                result = get_state(index, ctypes.byref(state))
+                if result == 0:
+                    value = state.Gamepad.wButtons
+                    buttons[index] = (bool(value & 0x10), bool(value & 0x20))
+                elif result != 1167:
+                    raise OSError(f'XInputGetState failed: {result}')
+            if not watcher.tick(buttons, time.monotonic()):
+                break
+            time.sleep(0.05)
+    except Exception as exc:
+        log_message(f'Controller menu watcher: {exc}')
+
+
+def windows_animations_enabled():
+    try:
+        enabled = ctypes.c_int(1)
+        if ctypes.windll.user32.SystemParametersInfoW(0x1042, 0, ctypes.byref(enabled), 0):
+            return bool(enabled.value)
+    except (AttributeError, OSError):
+        pass
+    return True
+
+
+_DPI_AWARE = False
+
+
+def enable_dpi_awareness():
+    """Become per-monitor DPI aware before any window exists.
+
+    Without this Windows lies to SDL about the window size on 125%/150% displays, so
+    everything is drawn at 100% and then bitmap-upscaled (soft). Once aware, SDL reports
+    true device pixels and render_density()/font scaling draw sharp at every scale.
+    """
+    global _DPI_AWARE
+    if _DPI_AWARE or os.name != 'nt':
+        return
+    _DPI_AWARE = True
+    try:
+        # Per-monitor v2 (Windows 10 1703+): keeps a resizable window sharp on every monitor.
+        try:
+            if ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+                return
+        except (AttributeError, OSError):
+            pass
+        try:
+            if ctypes.windll.shcore.SetProcessDpiAwareness(2) == 0:  # PROCESS_PER_MONITOR_DPI_AWARE
+                return
+        except (AttributeError, OSError):
+            pass
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except (AttributeError, OSError):
+            pass
+    except Exception:
+        pass
+
+
+def _set_black_caption(hwnd):
+    try:
+        set_attribute = ctypes.windll.dwmapi.DwmSetWindowAttribute
+        set_attribute.argtypes = (ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32)
+        set_attribute.restype = ctypes.c_long
+        # Older Windows versions can honor dark mode even without custom colors.
+        dark = ctypes.c_uint32(1)
+        if set_attribute(hwnd, 20, ctypes.byref(dark), ctypes.sizeof(dark)) != 0:
+            set_attribute(hwnd, 19, ctypes.byref(dark), ctypes.sizeof(dark))
+        for attribute, color in ((35, 0x000000), (36, 0xffffff)):
+            value = ctypes.c_uint32(color)
+            set_attribute(hwnd, attribute, ctypes.byref(value), ctypes.sizeof(value))
+    except (AttributeError, OSError):
+        pass  # Native system chrome remains usable if DWM is unavailable.
+
+
+def style_window_caption(window):
+    if os.name != 'nt' or not window:
+        return
+    from sdl2 import SDL_VERSION
+    from sdl2.syswm import SDL_GetWindowWMInfo, SDL_SysWMinfo, SDL_SYSWM_WINDOWS
+
+    info = SDL_SysWMinfo()
+    SDL_VERSION(info.version)
+    if SDL_GetWindowWMInfo(window, ctypes.byref(info)) and info.subsystem == SDL_SYSWM_WINDOWS:
+        _set_black_caption(info.info.win.window)
+
+
+def create_renderer(s, window, screenshot=False):
+    if screenshot:
+        return s.SDL_CreateRenderer(window, -1, s.SDL_RENDERER_SOFTWARE)
+    renderer = s.SDL_CreateRenderer(window, -1, s.SDL_RENDERER_ACCELERATED | s.SDL_RENDERER_PRESENTVSYNC)
+    return renderer or s.SDL_CreateRenderer(window, -1, s.SDL_RENDERER_SOFTWARE)
+
+
+def tip_offset(t, snap=False):
+    return 0 if snap else hint_motion.glow(t, reduced_motion=False)[1]
+
+
+def present_frame(s, renderer, flags):
+    s.SDL_RenderPresent(renderer)
+    if not (flags & s.SDL_RENDERER_ACCELERATED and flags & s.SDL_RENDERER_PRESENTVSYNC):
+        s.SDL_Delay(16)
+
+
+def draw_tip_line(p, parts, x, y, highlight_alpha=255):
+    for index, (part, color) in enumerate(zip(parts, (INK_DIM, INK, INK_DIM))):
+        if part:
+            if index == 1:
+                p.text('body', part, x, y, color, alpha=highlight_alpha, subpixel=True)
+            else:
+                p.text('body', part, x, y, color, subpixel=True)
+            x += p.measure('body', part)[0]
+
+
+def cli_command(*args):
+    if getattr(sys, 'frozen', False):
+        return [sys.executable, '--cli', *map(str, args)]
+    return [sys.executable, str(BASE / 'Get-HeyListen.py'), *map(str, args)]
+
+
+GAME_EXE = 'Griffin/Binaries/Win64/SWGR-Win64-Shipping.exe'
+
+
+def game_play_target(folder):
+    names = (GAME_EXE,)
+    try:
+        with (folder / '.heylisten-get' / 'game-manifest.json').open(encoding='utf-8-sig') as source:
+            manifest = json.load(source)
+    except FileNotFoundError:
+        return next((folder / name for name in names if (folder / name).is_file()), None)
+    except (OSError, ValueError, UnicodeError):
+        return None
+    if not isinstance(manifest, dict) or not isinstance(manifest.get('files'), list):
+        return None
+    entries = {item['path'].casefold(): item['path'] for item in manifest['files']
+               if isinstance(item, dict) and isinstance(item.get('path'), str)
+               and item['path'].casefold() in {name.casefold() for name in names}}
+    targets = [folder / entries[name.casefold()] for name in names if name.casefold() in entries]
+    # A missing manifest-owned executable is an incomplete install, not a
+    # reason to launch a different executable left behind by an older build.
+    return targets[0] if targets and all(path.is_file() for path in targets) else None
+
+
+def installed(folder):
+    return (folder / 'longshot_version.txt').is_file() and game_play_target(folder) is not None
+
+
+def probe_writable(folder):
+    folder.mkdir(parents=True, exist_ok=True)
+    probe = folder / ('.silverlantern-probe-' + str(os.getpid()))
+    try:
+        with probe.open('wb') as stream:
+            stream.write(b'1')
+            stream.flush()
+            os.fsync(stream.fileno())
+    finally:
+        probe.unlink(missing_ok=True)
+
+
+def _known_desktop():
+    if os.name != 'nt':
+        return None
+    try:
+        from ctypes import wintypes
+        class GUID(ctypes.Structure):
+            _fields_ = [('Data1', wintypes.DWORD), ('Data2', wintypes.WORD), ('Data3', wintypes.WORD), ('Data4', ctypes.c_ubyte * 8)]
+        desktop = GUID(0xB4BFCC3A, 0xDB2C, 0x424C, (ctypes.c_ubyte * 8)(0xB0, 0x29, 0x7F, 0xE9, 0x9A, 0x87, 0xC6, 0x41))
+        ole = ctypes.windll.ole32
+        shell = ctypes.windll.shell32
+        initialized = ole.CoInitializeEx(None, 2)
+        path = ctypes.c_wchar_p()
+        try:
+            shell.SHGetKnownFolderPath.argtypes = [ctypes.POINTER(GUID), wintypes.DWORD, wintypes.HANDLE, ctypes.POINTER(ctypes.c_wchar_p)]
+            shell.SHGetKnownFolderPath.restype = ctypes.c_long
+            if shell.SHGetKnownFolderPath(ctypes.byref(desktop), 0, None, ctypes.byref(path)) == 0 and path.value:
+                return Path(path.value)
+        finally:
+            if path:
+                ole.CoTaskMemFree(path)
+            if initialized in (0, 1):
+                ole.CoUninitialize()
+    except (AttributeError, OSError, ValueError):
+        pass
+    return None
+
+
+def shortcut_path():
+    desktop = Path(_TEST_DESKTOP_DIR) if _TEST_DESKTOP_DIR else (_known_desktop() or Path(os.environ.get('USERPROFILE', str(Path.home()))) / 'Desktop')
+    return desktop / (GAME_NAME.replace(':', '') + '.lnk')
+
+
+def launcher_target(folder):
+    folder = Path(folder)
+    fallback = Path(os.environ.get('LOCALAPPDATA', str(Path.home()))) / 'Programs' / 'Ocarina of Time'
+    if getattr(sys, 'frozen', False):
+        running = Path(sys.executable).resolve()
+        if (running.parent in (folder.resolve(), fallback.resolve())
+                and re.fullmatch(r'Ocarina of Time(?:-[^/\\]+)?\.exe', running.name, re.IGNORECASE)):
+            return running
+    return folder / 'Ocarina of Time.exe'
+
+
+def create_shortcut(folder, enabled=True, exe=None):
+    link = shortcut_path()
+    if not enabled:
+        link.unlink(missing_ok=True)
+        return
+    target = exe or launcher_target(folder)
+    create_link(link, target, target.parent)
+
+
+def ps_quote(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def log_message(message):
+    text = str(message)
+    try:
+        LOG.parent.mkdir(parents=True, exist_ok=True)
+        with LOG.open('a', encoding='utf-8') as stream:
+            stream.write(text + '\n')
+    except OSError:
+        pass
+    try:
+        if sys.stdout is not None:
+            print(text, file=sys.stdout, flush=True)
+    except (OSError, ValueError):
+        pass
+
+
+def powershell(script, wait=True, timeout=60):
+    encoded = base64.b64encode(script.encode('utf-16le')).decode('ascii')
+    args = ['powershell', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded]
+    flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+    if wait:
+        return subprocess.run(args, check=True, creationflags=flags, stderr=subprocess.PIPE, timeout=timeout)
+    return subprocess.Popen(args, creationflags=flags, close_fds=True)
+
+
+DEFENDER_TIMEOUT = 75  # seconds to wait for the UAC consent prompt before giving up
+
+
+def defender_elevated(folder, enable):
+    if os.name != 'nt':
+        return False
+    cmd = ('Add-MpPreference' if enable else 'Remove-MpPreference') + ' -ExclusionPath ' + ps_quote(folder) + ' -ErrorAction Stop'
+    encoded = base64.b64encode(cmd.encode('utf-16le')).decode('ascii')
+    script = ("$ErrorActionPreference='Stop'; try { $p=Start-Process powershell -Verb RunAs -Wait -PassThru -WindowStyle Hidden "
+              "-ArgumentList '-NoProfile -NonInteractive -EncodedCommand " + encoded + "'; if ($null -eq $p) { exit 1 }; exit $p.ExitCode } catch { exit 1 }")
+    try:
+        powershell(script, timeout=DEFENDER_TIMEOUT)
+        return True
+    except (OSError, subprocess.SubprocessError):
+        # Timeout, denial, or a failure: the exclusion is only an optimization. Never fatal.
+        return False
+
+
+def defender_config():
+    try:
+        return json.loads(CONFIG.read_text(encoding='utf-8-sig'))
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def defender_active():
+    if os.name != 'nt':
+        return False
+    script = ("$p=Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntivirusProduct -ErrorAction Stop; "
+              "$active=@($p | Where-Object { (($_.productState -shr 12) -band 15) -eq 1 }); "
+              "if ($active.Count -eq 0) { exit 2 }; "
+              "if (@($active | Where-Object { $_.displayName -notmatch 'Windows Defender|Microsoft Defender' }).Count) { exit 1 }; exit 0")
+    try:
+        powershell(script, timeout=15)
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def defender_exclusion_present(folder):
+    script = ("$paths=(Get-MpPreference -ErrorAction Stop).ExclusionPath; "
+              "$wanted=[IO.Path]::GetFullPath(" + ps_quote(folder) + ").TrimEnd('\\'); "
+              "foreach ($p in $paths) { if ([string]::Equals([IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($p)).TrimEnd('\\'), $wanted, [StringComparison]::OrdinalIgnoreCase)) { exit 0 } }; exit 1")
+    try:
+        powershell(script, timeout=15)
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def optimize_defender(folder):
+    config = defender_config()
+    folder = Path(folder).resolve()
+    if not defender_active():
+        log_message('Defender is not the active antivirus or its status is unavailable; continuing with file-lock waiting.')
+        return False
+    state = config.get('defender_state')
+    if state == 'on':
+        if config.get('defender_path') == str(folder):
+            verified = defender_exclusion_present(folder)
+            log_message(f'Defender existing exclusion verified={verified} path={folder}')
+            if verified:
+                return True
+            state = None
+        else:
+            # Never lose track of an exclusion when the game folder changes.
+            return False
+    if state in ('unknown', 'declined'):
+        # Previously denied or timed out; don't nag every run. Clear the config to ask again.
+        return False
+    log_message('Waiting for Windows permission… click Yes if Windows asks.')
+    success = False
+    for attempt in range(1, 3):
+        added = defender_elevated(folder, True)
+        verified = defender_exclusion_present(folder) if added else False
+        log_message(f'Defender exclusion attempt={attempt} added={added} verified={verified} path={folder}')
+        if verified:
+            success = True
+            break
+        if not added:
+            break
+    config['defender_state'] = 'on' if success else 'declined'
+    if success:
+        config['defender_path'] = str(folder)
+    else:
+        log_message('Continuing without optimizing.')
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG.with_suffix('.tmp')
+    tmp.write_text(json.dumps(config), encoding='utf-8')
+    os.replace(tmp, CONFIG)
+    return success
+
+
+def remove_defender_exclusion():
+    config = defender_config()
+    if config.get('defender_state') == 'on' and config.get('defender_path'):
+        return defender_elevated(Path(config['defender_path']), False)
+    return True
+
+
+def play_install_chime():
+    if os.name != 'nt' or _test_gui_install_enabled():
+        return
+    try:
+        import winsound
+        winsound.PlaySound('SystemNotification', winsound.SND_ALIAS | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+    except (ImportError, RuntimeError, OSError):
+        pass  # Sound is optional; an unavailable audio device cannot fail an install.
+
+
+def create_link(link, target, working_dir):
+    script = '$s=New-Object -ComObject WScript.Shell; $l=$s.CreateShortcut(' + ps_quote(link) + '); $l.TargetPath=' + ps_quote(target) + '; $l.WorkingDirectory=' + ps_quote(working_dir) + '; $l.Save()'
+    for attempt in range(2):
+        try:
+            link.parent.mkdir(parents=True, exist_ok=True)
+            powershell(script)
+            return True
+        except (OSError, subprocess.SubprocessError) as exc:
+            stderr = getattr(exc, 'stderr', None)
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode(errors='replace')
+            log_message(f'Shortcut {link} attempt {attempt + 1}: {exc}; stderr: {stderr or "(empty)"}')
+    return False
+
+
+def start_menu_path():
+    folder = Path(_TEST_STARTMENU_DIR) if _TEST_STARTMENU_DIR else Path(os.environ.get('APPDATA', str(Path.home()))) / 'Microsoft' / 'Windows' / 'Start Menu' / 'Programs'
+    return folder / (GAME_NAME.replace(':', '') + '.lnk')
+
+
+UNINSTALL_KEY = _TEST_REG_ROOT.rstrip('\\') + r'\sable-loop'
+OWNED_FILES = ('SilverLantern.exe', 'HeyListen-Get.exe', 'SDL2.dll', 'sources.json',
+               'README.md', 'Apply-HeyListen-Preset.ps1', 'SilverLantern-Get.cmd',
+               'SilverLantern-Preset.cmd', 'Update-Game.ps1', 'Watch-Game.ps1',
+               'SilverLantern-AutoUpdate.cmd', 'sources.cache.json', 'HeyListen-Get.log',
+               'SilverLantern.exe.update-backup', 'HeyListen-Get.exe.update-backup',
+               'Run Silver Lantern.exe', 'Run HeyListen.exe')
+OWNED_FILES += tuple('support/' + name for name in OWNED_FILES if name not in ('Run Silver Lantern.exe', 'Run HeyListen.exe'))
+
+
+def register_install(folder, exe=None):
+    if winreg is None:
+        return
+    exe = exe or launcher_target(folder)
+    try:
+        create_shortcut(Path(folder), exe=exe)
+    except Exception as exc:
+        log_message(f'Desktop shortcut: {exc}')
+    try:
+        link = start_menu_path()
+        create_link(link, exe, exe.parent)
+    except Exception as exc:
+        log_message(f'Start Menu shortcut: {exc}')
+    size = 0
+    for base, dirs, files in os.walk(folder, followlinks=False):
+        for name in files:
+            try:
+                size += (Path(base) / name).stat().st_size
+            except OSError:
+                pass
+    try:
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, UNINSTALL_KEY) as key:
+            for name, value, kind in (
+                ('DisplayName', GAME_NAME, winreg.REG_SZ), ('DisplayIcon', str(exe), winreg.REG_SZ),
+                ('InstallLocation', str(exe.parent), winreg.REG_SZ),
+                ('UninstallString', '"' + str(exe) + '" --uninstall', winreg.REG_SZ),
+                ('NoModify', 1, winreg.REG_DWORD), ('NoRepair', 1, winreg.REG_DWORD),
+                ('EstimatedSize', min((size + 1023) // 1024, 0xffffffff), winreg.REG_DWORD)):
+                winreg.SetValueEx(key, name, 0, kind, value)
+    except Exception as exc:
+        log_message(f'Uninstall registration: {exc}')
+
+
+def remove_registration():
+    if winreg is not None:
+        try:
+            winreg.DeleteKey(winreg.HKEY_CURRENT_USER, UNINSTALL_KEY)
+        except FileNotFoundError:
+            pass
+
+
+def cache_game_manifest(folder, manifest):
+    cache = folder / '.heylisten-get' / 'game-manifest.json'
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    temp = cache.with_suffix('.tmp')
+    temp.write_text(json.dumps(manifest), encoding='utf-8')
+    os.replace(temp, cache)
+
+
+def manifest_digest(manifest):
+    return hashlib.sha256(json.dumps(manifest, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
+def installed_manifest_digest(folder):
+    try:
+        with (Path(folder) / '.heylisten-get' / 'game-manifest.json').open(encoding='utf-8') as source:
+            return manifest_digest(json.load(source))
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def channel_error_message(exc):
+    import game_channel
+    if isinstance(exc, game_channel.StaleChannel):
+        return 'Problem: The update information is out of date. What to do: Try again later.'
+    if isinstance(exc, game_channel.CorruptState):
+        return 'Problem: The saved update information is damaged. What to do: Contact support for help repairing it.'
+    if isinstance(exc, game_channel.ChecksumMismatch):
+        return 'Problem: The update information failed its safety check. What to do: Try again later.'
+    if isinstance(exc, TimeoutError):
+        return 'Problem: Another installation or update is busy. What to do: Wait for it to finish, then retry.'
+    if isinstance(exc, ValueError):
+        return 'Problem: The update information is invalid. What to do: Try again later.'
+    return 'Problem: Could not reach the update server. What to do: Check your connection and retry.'
+
+
+def fetch_channel_manifest(folder, session):
+    import game_channel
+    import importlib.util
+    parser = sys.modules.get('__main__')
+    if not hasattr(parser, 'parse_game_manifest'):
+        spec = importlib.util.spec_from_file_location('silver_manifest_parser', ROOT / 'Get-HeyListen.py')
+        parser = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(parser)
+    if _TEST_GAME_MANIFEST:
+        return parser.parse_game_manifest(Path(_TEST_GAME_MANIFEST).read_text(encoding='utf-8-sig'))
+    with game_channel.install_lock(folder):
+        return game_channel.fetch_for_folder(folder, lambda url: game_channel.fetch_bytes(session, url), lambda data: parser.parse_game_manifest(data.decode('utf-8-sig')), legacy_url=game_manifest_url())
+
+
+def fetch_ownership_manifest():
+    with urllib.request.urlopen(game_manifest_url(), timeout=10) as response:
+        return json.load(response)
+
+
+def ownership_manifest(folder):
+    try:
+        with (folder / '.heylisten-get' / 'game-manifest.json').open(encoding='utf-8') as stream:
+            manifest = json.load(stream)
+        if not isinstance(manifest.get('files'), list):
+            raise ValueError('invalid manifest')
+        return manifest
+    except (OSError, ValueError, AttributeError):
+        try:
+            manifest = fetch_ownership_manifest()
+            return manifest if isinstance(manifest.get('files'), list) else None
+        except (OSError, ValueError, AttributeError):
+            return None
+
+
+def manifest_owned_files(folder, manifest):
+    result = []
+    root = folder.resolve()
+    for item in (manifest or {}).get('files', []):
+        try:
+            name = item['path']
+            if not isinstance(name, str) or '\\' in name or ':' in name:
+                continue
+            parts = name.split('/')
+            if any(part in ('', '.', '..') or part.casefold() == 'user' for part in parts):
+                continue
+            path = folder.joinpath(*parts)
+            if path.is_symlink() or not path.resolve().is_relative_to(root):
+                continue
+            if path.is_file() and path.stat().st_size == item['size']:
+                result.append(path)
+        except (OSError, KeyError, TypeError):
+            continue
+    return result
+
+
+def load_game_folder():
+    try:
+        value = json.loads(CONFIG.read_text(encoding='utf-8-sig')).get('game_dir')
+        return Path(value).expanduser() if value else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def game_folder_candidates():
+    profile = Path(os.environ.get('USERPROFILE', str(Path.home())))
+    legacy = profile / 'Games' / 'sable-loop-game'
+    primary = Path(r'C:\Games') / 'sable-loop-game'
+    fallback = profile / 'Games' / 'sable-loop-game'
+    return primary, fallback, legacy
+
+
+def cached_partial_mtime(folder):
+    """Find safe, nonempty installer partials without following cache links."""
+    cache = Path(folder) / '.heylisten-parts'
+    try:
+        if cache.is_symlink() or not cache.is_dir():
+            return 0.0
+        newest = 0.0
+        for entry in cache.iterdir():
+            if (re.fullmatch(r'[A-Za-z0-9_.-]+\.part', entry.name)
+                    and entry.name not in ('.part', '..part')
+                    and not entry.is_symlink() and entry.is_file()):
+                stat = entry.stat()
+                if stat.st_size:
+                    newest = max(newest, stat.st_mtime)
+        return newest
+    except OSError:
+        return 0.0
+
+
+def has_game_data(folder):
+    """True when `folder` holds an installed, partial or cached game (not just user files)."""
+    folder = Path(folder)
+    if not folder.is_dir():
+        return False
+    if (folder / '.heylisten-get' / 'game-manifest.json').is_file():
+        return True
+    if (folder / 'longshot_version.txt').is_file():
+        return True
+    try:
+        for pat in ('*.part', '*.part.json', '*.p*.part', '*.join'):
+            if any(True for _ in folder.glob(pat)):
+                return True
+    except OSError:
+        pass
+    return bool(cached_partial_mtime(folder))
+
+
+def game_data_mtime(folder):
+    folder = Path(folder)
+    newest = cached_partial_mtime(folder)
+    for marker in (folder / '.heylisten-get' / 'game-manifest.json', folder / GAME_EXE,
+                   folder / 'longshot_version.txt'):
+        try:
+            newest = max(newest, marker.stat().st_mtime)
+        except OSError:
+            pass
+    return newest
+
+
+def adopt_existing(candidates):
+    """Return the newest candidate folder that already holds game data, or None.
+
+    This is what stops a second 33 GB download when a partial install is already on
+    disk in another candidate location.
+    """
+    with_data = [Path(c) for c in candidates if has_game_data(c)]
+    return max(with_data, key=game_data_mtime) if with_data else None
+
+
+def resolve_game_folder():
+    configured = load_game_folder()
+    if configured:
+        return configured
+    primary, fallback, legacy = game_folder_candidates()
+    # First run (no configured destination): resume an existing partial or full
+    # install instead of silently downloading a second copy into a fresh folder.
+    adopted = adopt_existing((legacy, primary, fallback))
+    if adopted:
+        return adopted
+    if legacy.exists():
+        return legacy
+    try:
+        probe_writable(primary)
+        return primary
+    except OSError:
+        return fallback
+
+
+def _launcher_records(destination):
+    try:
+        records = json.loads((Path(destination) / '.heylisten-get' / 'launcher-copies.json').read_text(encoding='utf-8'))
+        return records if isinstance(records, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _launcher_hash(path):
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _save_launcher_records(destination, records):
+    import tempfile
+    directory = Path(destination) / '.heylisten-get'
+    directory.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(dir=directory, prefix='launcher-copies-', suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as out:
+            json.dump(records, out)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(name, directory / 'launcher-copies.json')
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+
+def _record_launcher_copy(destination, target):
+    records = _launcher_records(destination)
+    records[Path(target).name] = _launcher_hash(target)
+    _save_launcher_records(destination, records)
+
+
+def _delete_verified_launcher(path, expected):
+    # A deny-write/deny-delete handle prevents a pathname swap while hashing.
+    # Delete through that same handle, never through the subsequently looked-up path.
+    if os.name != 'nt':
+        return False  # No equivalent portable atomic verify-and-delete primitive.
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                  ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.SetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    kernel.SetFileInformationByHandle.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel.CreateFileW(str(path), 0x80000000 | 0x00010000, 1, None, 3, 0x00200000, None)
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        fd = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+    except BaseException:
+        kernel.CloseHandle(handle)
+        raise
+    with os.fdopen(fd, 'rb') as stream:
+        digest = hashlib.sha256()
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(block)
+        if digest.hexdigest() != expected:
+            return False
+        _qa_pause('sibling_race')
+        disposition = wintypes.BOOL(True)
+        if not kernel.SetFileInformationByHandle(handle, 4, ctypes.byref(disposition), ctypes.sizeof(disposition)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return True
+
+
+def _cleanup_stale_siblings(destination, keep):
+    destination = Path(destination)
+    records = _launcher_records(destination)
+    keep = Path(keep).resolve()
+    running = Path(sys.executable).resolve() if getattr(sys, 'frozen', False) else None
+    for name, digest in list(records.items()):
+        if not isinstance(name, str) or not re.fullmatch(r'Ocarina of Time-[^/\\]+\.exe', name, re.IGNORECASE):
+            continue
+        stale = destination / name
+        try:
+            if stale.is_symlink() or stale.resolve() in (keep, running):
+                continue
+            if _delete_verified_launcher(stale, digest):
+                del records[name]
+        except OSError:
+            continue
+    _save_launcher_records(destination, records)
+
+
+def relocate_launcher(folder):
+    if not getattr(sys, 'frozen', False):
+        return False
+    source = Path(sys.executable).resolve()
+    fallback = Path(os.environ.get('LOCALAPPDATA', str(Path.home()))) / 'Programs' / 'Ocarina of Time'
+    try:
+        probe_writable(folder)
+        destination = Path(folder)
+    except OSError:
+        destination = fallback
+        probe_writable(destination)
+    target = destination / 'Ocarina of Time.exe'
+    if source == target.resolve():
+        return False
+    if target.exists():
+        destination = fallback
+        probe_writable(destination)
+        target = destination / 'Ocarina of Time.exe'
+        if source.parent == destination.resolve():
+            return False
+    import game_channel
+    with game_channel.state_lock(destination / '.heylisten-get', name='launcher-relocation.lock'):
+        try:
+            with source.open('rb') as original, target.open('xb') as copy:
+                shutil.copyfileobj(original, copy)
+        except FileExistsError:
+            # Never overwrite or run an executable whose ownership is unknown.
+            import tempfile
+            with source.open('rb') as original, tempfile.NamedTemporaryFile(
+                    prefix='Ocarina of Time-', suffix='.exe', dir=destination, delete=False) as copy:
+                target = Path(copy.name)
+                try:
+                    shutil.copyfileobj(original, copy)
+                except BaseException:
+                    copy.close()
+                    target.unlink(missing_ok=True)
+                    raise
+        if _launcher_hash(source) != _launcher_hash(target):
+            raise OSError('Launcher copy verification failed; please retry.')
+        _record_launcher_copy(destination, target)
+        try:
+            _cleanup_stale_siblings(destination, target)
+        except Exception as exc:
+            log_message(f'Launcher cleanup: {exc}')
+        log_message(f'Launcher relocation: {target}')
+        try:
+            register_install(destination, exe=target)
+        except Exception as exc:
+            log_message(f'Install registration: {exc}')
+        subprocess.Popen([str(target), *sys.argv[1:]], close_fds=False)
+        return True
+
+
+def schedule_owned_cleanup():
+    if not getattr(sys, 'frozen', False):
+        return
+    exe = Path(sys.executable).resolve()
+    folder = exe.parent
+    script = (f'$p=Get-Process -Id {os.getpid()} -ErrorAction SilentlyContinue; '
+              'if($p -and -not $p.WaitForExit(30000)){exit}; '
+              f'$file={ps_quote(exe)}; for($i=0;$i -lt 60;$i++) {{ '
+              'Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue; '
+              'if(-not (Test-Path -LiteralPath $file)) { break }; Start-Sleep -Milliseconds 500 }; '
+              f'try {{ [System.IO.Directory]::Delete({ps_quote(folder)}, $false) }} catch {{}}')
+    powershell(script, wait=False)
+
+
+def confirm_uninstall(message, gui=False):
+    if gui and os.name == 'nt':
+        return ctypes.windll.user32.MessageBoxW(None, message, 'Uninstall HeyListen', 0x24) == 6
+    log_message(message)
+    return input('Continue? [y/N] ').strip().lower() == 'y'
+
+
+def uninstall(keep_saves=True, purge_saves=False, gui=False):
+    folder = load_game_folder()
+    if purge_saves:
+        message = 'This removes the game folder, including your saves, and the launcher files and settings.'
+    else:
+        saves = folder / 'user' if folder else '(game folder not configured)'
+        message = ('This removes game files, shortcuts, launcher files and settings; the saves folder remains.\n'
+                   f'Your saves stay at {saves} — use --purge-saves to remove them too')
+    message += f'\nGame folder: {folder or "(not configured)"}'
+    if not confirm_uninstall(message, gui):
+        log_message('Uninstall cancelled.')
+        return False
+    if folder:
+        import game_channel
+        lock = game_channel.install_lock(folder, timeout=0)
+        try:
+            lock.__enter__()
+        except TimeoutError:
+            message = 'An installation or update is in progress. Please wait for it to finish, then retry uninstall.'
+            if gui and os.name == 'nt':
+                ctypes.windll.user32.MessageBoxW(None, message, 'Uninstall HeyListen', 0x30)
+            log_message(message)
+            return False
+        try:
+            return _uninstall_locked(folder, purge_saves)
+        finally:
+            lock.__exit__(None, None, None)
+    return _uninstall_locked(folder, purge_saves)
+
+
+def _uninstall_locked(folder, purge_saves):
+    had_folder = bool(folder and folder.exists())
+    if had_folder:
+        game = folder.resolve()
+        home = Path.home().resolve()
+        state = STATE_DIR.resolve()
+        if game == Path(game.anchor) or home == game or home.is_relative_to(game) or state == game or state.is_relative_to(game):
+            raise RuntimeError('Refusing to remove an unsafe game folder.')
+        if not remove_defender_exclusion():
+            raise RuntimeError('Could not remove the Windows Defender exclusion; retry uninstall or remove it in Windows Security.')
+        running = Path(sys.executable).resolve() if getattr(sys, 'frozen', False) else None
+        owned = manifest_owned_files(folder, ownership_manifest(folder))
+        owned.extend(folder / name for name in OWNED_FILES)
+        owned.append(folder / game_settings.INI_NAME)
+        owned.append(folder / '.heylisten-get' / 'game-manifest.json')
+        for path in owned:
+            try:
+                if path.resolve() != running and path.resolve().is_relative_to(folder.resolve()) and not path.is_symlink() and path.is_file():
+                    path.unlink()
+            except OSError:
+                pass
+        if purge_saves:
+            saves = folder / 'user'
+            if saves.is_dir() and not saves.is_symlink():
+                shutil.rmtree(saves)
+        unknown = sum(1 for base, dirs, files in os.walk(folder, followlinks=False)
+                      if not Path(base).relative_to(folder).parts or Path(base).relative_to(folder).parts[0].casefold() != 'user'
+                      for name in files if (Path(base) / name).resolve() != running
+                      and (Path(base) / name) != folder / '.heylisten-get' / 'install-operation.lock')
+        log_message(f'Unknown user files preserved: {unknown}')
+        for base, dirs, files in os.walk(folder, topdown=False, followlinks=False):
+            try:
+                Path(base).rmdir()
+            except OSError:
+                pass
+    if not had_folder and not remove_defender_exclusion():
+        raise RuntimeError('Could not remove the Windows Defender exclusion; retry uninstall or remove it in Windows Security.')
+    shortcut_path().unlink(missing_ok=True)
+    start_menu_path().unlink(missing_ok=True)
+    remove_registration()
+    if STATE_DIR.exists():
+        shutil.rmtree(STATE_DIR)
+    if had_folder:
+        try:
+            LOG.parent.mkdir(parents=True, exist_ok=True)
+            with LOG.open('a', encoding='utf-8') as log:
+                log.write(f'Unknown user files preserved: {unknown}\n')
+        except OSError:
+            pass
+    schedule_owned_cleanup()
+    return True
+
+
+def fmt_bytes(n):
+    n = float(n or 0)
+    for unit in ('B', 'KB', 'MB', 'GB'):
+        if n < 1024 or unit == 'GB':
+            return f'{n:.0f} {unit}' if unit == 'B' else f'{n:.1f} {unit}'
+        n /= 1024
+    return f'{n:.1f} GB'
+
+
+def fmt_eta(seconds):
+    seconds = max(0, int(seconds))
+    h, rest = divmod(seconds, 3600)
+    m, s = divmod(rest, 60)
+    if h:
+        return f'{h} h {m:02d} min'
+    if m:
+        return f'{m} min {s:02d} s'
+    return f'{s} s'
+
+
+PROGRESS_RECORDS = ('HLINSTALL ', 'HLINSTALL_STAGE ', 'HLPROGRESS ', 'HLUPDATE ', 'HLVERIFY ')
+GAME_OPERATIONS = ('download', 'update')
+GAME_RATE_TIMEOUT = 3.0
+INSTALL_STAGE_LABELS = {'assembly': 'Installing game files', 'retry': 'Retrying installation'}
+
+
+def parse_progress(line):
+    if line.startswith('HLINSTALL_STAGE '):
+        match = re.fullmatch(r'HLINSTALL_STAGE name=(assembly|retry)', line.strip())
+        return {'install_stage': match[1]} if match else None
+    if line.startswith('HLINSTALL '):
+        match = re.fullmatch(r'HLINSTALL done=([0-9]{1,20}) total=([0-9]{1,20})', line.strip())
+        if match:
+            done, total = map(int, match.groups())
+            return {'install_pct': min(99, done * 100 // total) if total else 0}
+        return None
+    if line.startswith('HLVERIFY '):
+        fields = dict(re.findall(r'(\w+)=([^ ]+)', line[9:]))
+        try:
+            done, total = int(fields['done']), int(fields['total'])
+        except (KeyError, ValueError):
+            return None
+        return {'text': f'Checking {done} of {total} bundles', 'phase': 'Verifying the download...',
+                'done': 0, 'total': 0, 'speed': 0, 'pct': None}
+    if line.startswith('HLPROGRESS '):
+        fields = dict(re.findall(r'(\w+)=([^ ]+)', line[11:]))
+        try:
+            done, total, speed = (int(fields.get(k, 0)) for k in ('done', 'total', 'speed'))
+        except ValueError:
+            return None
+        phase = fields.get('phase', 'Downloading').replace('_', ' ')
+        if phase == 'Checking':
+            return {'text': 'Checking game files...', 'phase': 'Verifying the download...',
+                    'done': 0, 'total': 0, 'speed': 0, 'pct': None}
+        pct = done * 100 // total if total > 0 else None
+        text = f'{phase}: {pct}%' if pct is not None else phase
+        return {'text': text, 'phase': phase, 'done': done, 'total': total, 'speed': speed, 'pct': pct,
+                'eta_reliable': fields.get('eta') != '0'}
+    if line.startswith('HLUPDATE '):
+        return dict(re.findall(r'(\w+)=([^ ]+)', line[9:]))
+    if 'Downloading:' in line:
+        return {'text': line.strip()}
+    return None
+
+
+def game_progress_phase(value):
+    if not isinstance(value, dict):
+        return None
+    if 'install_stage' in value:
+        return INSTALL_STAGE_LABELS.get(value['install_stage'])
+    text = value.get('text', '').casefold()
+    phase = value.get('phase')
+    if text.startswith('connection stalled'):
+        return 'Retrying connection'
+    if phase == 'Verifying the download...':
+        return 'Verifying game files'
+    if phase == 'Downloading':
+        return 'Downloading game files'
+    if text.startswith(('starting bundle download', 'preparing download', 'preparation complete')):
+        return 'Preparing download'
+    if text.startswith(('checking installation plan', 'planning')):
+        return 'Checking existing files'
+    if text.startswith(('bundle download and installation complete', 'the game is installed')):
+        return 'Finishing installation'
+    return None
+
+
+def game_progress_detail(value):
+    if value.get('phase') == 'Downloading' and value.get('speed', 0) > 0:
+        speed = value['speed']
+        detail = fmt_bytes(speed) + '/s'
+        remaining = value.get('total', 0) - value.get('done', 0)
+        if remaining > 0 and value.get('eta_reliable', True):
+            detail += f' · About {fmt_eta((remaining + speed - 1) // speed)} left to download'
+        return detail
+    text = value.get('text', '').strip()
+    start = re.fullmatch(r'Preparing download: organizing ([0-9]{1,9}) destination files', text)
+    if start:
+        return f'Checking 0 of {int(start[1]):,} files'
+    match = re.fullmatch(
+        r'(?:Checking installation plan|Preparing download): ([0-9]{1,9})/([0-9]{1,9}) (?:destination )?files checked',
+        text,
+    )
+    if match:
+        done, total = map(int, match.groups())
+        if done <= total:
+            return f'Checking {done:,} of {total:,} files'
+    return ''
+
+
+def _strip_ansi(text):
+    return re.sub(r'\x1b\[[0-9;]*m', '', text)
+
+
+def friendly_blocks(lines):
+    """Extract the child's last Problem / What to do blocks and its details line.
+
+    The installer prints friendly, wrapped ``Problem:`` and ``What to do:`` prose
+    followed by ``Details were saved to: <path>``. The GUI error screen should show
+    that prose instead of only the final ``Details were saved to`` line.
+    """
+    problem, action, details = [], [], None
+    target = None
+    for raw in lines:
+        line = _strip_ansi(str(raw)).strip()
+        if line.startswith('Problem:'):
+            problem, action = [line[len('Problem:'):].strip()], []
+            target = 'problem'
+            continue
+        if line.startswith('What to do:'):
+            action = [line[len('What to do:'):].strip()]
+            target = 'action'
+            continue
+        if line.startswith('Details were saved to:'):
+            details = line[len('Details were saved to:'):].strip()
+            target = None
+            continue
+        if not line:
+            target = None
+            continue
+        if target == 'problem':
+            problem.append(line)
+        elif target == 'action':
+            action.append(line)
+    return ' '.join(x for x in problem if x).strip(), ' '.join(x for x in action if x).strip(), details
+
+
+def gui_child_text(text):
+    """Remove console dot leaders without altering the underlying log."""
+    return re.sub(r'\s*(?:\.\s*){3,}', lambda m: ' ' if m.start() and text[:m.start()].rstrip().endswith(':') else ': ', text).strip()
+
+
+def friendly_gui_text(text):
+    """Remove console formatting and filesystem paths from friend-facing prose."""
+    text = gui_child_text(text)
+    return re.sub(r'(?i)(?:[a-z]:[\\/]|\\\\|/)[^\s,;]+', 'a file', text)
+
+
+CHILD_IDLE_TIMEOUT = 120
+
+
+def stop_child(process):
+    if process.poll() is None:
+        if os.name == 'nt':
+            try:
+                subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+                               creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+            except (OSError, subprocess.SubprocessError):
+                pass
+        if process.poll() is None:
+            process.kill()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        raise TimeoutError('Could not stop the stalled installer process.')
+
+
+def child_output(process, phase, idle_timeout=CHILD_IDLE_TIMEOUT):
+    messages = queue.Queue()
+    def read_output():
+        try:
+            for line in process.stdout:
+                messages.put((line, None))
+        except Exception as exc:
+            messages.put((None, exc))
+        finally:
+            messages.put((None, None))
+    threading.Thread(target=read_output, daemon=True).start()
+    while True:
+        try:
+            line, error = messages.get(timeout=idle_timeout)
+        except queue.Empty:
+            stop_child(process)
+            raise TimeoutError(f'{phase} stopped responding for {idle_timeout:g} seconds. Please retry and check the log.')
+        if error is not None:
+            stop_child(process)
+            raise error
+        if line is None:
+            return
+        if line.strip() and not line.startswith(PROGRESS_RECORDS):
+            phase = line.strip()[:160]
+        yield line
+
+
+def worker_command(events, args):
+    process = None
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        env = dict(parent_identity.parent_environment(), SILVER_LANTERN_GUI_PROGRESS='1')
+        last_line = ''
+        screen_lines = []
+        # Open the log before starting the worker: if the log cannot be opened the
+        # worker is never spawned, so no orphaned installer survives the failure.
+        with LOG.open('a', encoding='utf-8') as log:
+            process = subprocess.Popen(cli_command(*args), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', bufsize=1, env=env, creationflags=getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0))
+            events.process = process
+            if events.cancelled.is_set():
+                terminate_worker(events)
+            for line in child_output(process, 'Game installation or update'):
+                rate_received_at = time.monotonic() if line.startswith('HLPROGRESS ') else None
+                log.write(line if line.endswith('\n') else line + '\n')
+                log.flush()
+                if line.strip() and not line.startswith(PROGRESS_RECORDS):
+                    last_line = gui_child_text(line)
+                    screen_lines.append(last_line)
+                progress = parse_progress(line) or {'text': line.strip()}
+                if rate_received_at is not None and progress.get('phase') == 'Downloading':
+                    progress['rate_received_at'] = rate_received_at
+                if 'text' in progress:
+                    progress['text'] = gui_child_text(progress['text'])
+                events.publish('progress', progress)
+        try:
+            code = process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            stop_child(process)
+            raise TimeoutError('Game installation or update did not exit. Please retry and check the log.')
+        if events.cancelled.is_set():
+            events.publish('cancelled', code)
+        elif code == 0:
+            events.publish('complete', code)
+        else:
+            problem, action, _ = friendly_blocks(screen_lines)
+            if problem:
+                message = 'Problem: ' + problem
+                if action:
+                    message += ' What to do: ' + action
+            else:
+                message = 'Problem: The installation could not finish. What to do: Please try again.'
+            events.publish('error', friendly_gui_text(message))
+    except Exception as exc:
+        # A worker that was already started must not outlive a failed run.
+        if process is not None:
+            try:
+                terminate_worker(events)
+            except Exception:
+                pass
+        log_message('Game installation or update failed:\n' + traceback.format_exc())
+        events.publish('error', 'Problem: The installation could not finish. What to do: Try again and check the log if it repeats.')
+
+
+def tool_update_worker(events, args):
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        env = parent_identity.parent_environment()
+        result = subprocess.run([sys.executable, '--self-update', *args], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', timeout=300, env=env, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        output = result.stdout or ''
+        with LOG.open('a', encoding='utf-8') as log:
+            log.write(output)
+        if result.returncode:
+            problem, action, _ = friendly_blocks(output.splitlines())
+            if problem:
+                message = 'Problem: ' + gui_child_text(problem)
+                if action:
+                    message += ' What to do: ' + gui_child_text(action)
+            else:
+                message = 'Problem: The launcher update could not finish. What to do: Please try again later.'
+            events.publish('error', friendly_gui_text(message))
+        elif 'SILVERLANTERN_UPDATE_HANDOFF' in output.splitlines():
+            events.publish('tool_complete', 0)
+        else:
+            events.publish('tool_current', 0)
+    except subprocess.TimeoutExpired:
+        log_message('Tool update timed out:\n' + traceback.format_exc())
+        events.publish('error', 'Tool update timed out. Please retry and check the log.')
+    except Exception:
+        log_message('Tool update failed:\n' + traceback.format_exc())
+        events.publish('error', 'Problem: The launcher update could not finish. What to do: Please try again later.')
+
+
+def terminate_worker(events):
+    events.cancel()
+    process = getattr(events, 'process', None)
+    if process and process.poll() is None:
+        if os.name == 'nt':
+            subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        else:
+            process.terminate()
+
+
+class InputMapper:
+    def __init__(self):
+        self.direction = None
+        self.next_repeat = 0
+        self.fast = False
+
+    def feed(self, event, now):
+        if event['type'] == 'button':
+            button = event['button']
+            if button in ('a', 'b'):
+                return [] if event['down'] else [{'a': 'accept', 'b': 'back'}[button]]
+            if event['down']:
+                action = {'start': 'menu', 'x': 'cancel'}.get(button)
+                return [action] if action else []
+        if event['type'] == 'axis':
+            x, y = event['x'], event['y']
+            magnitude = (x*x + y*y) ** .5
+            if magnitude < (.25 if self.direction else .35):
+                self.direction = None
+            elif magnitude >= .35:
+                direction = ('right' if x > 0 else 'left') if abs(x) > abs(y) else ('down' if y > 0 else 'up')
+                self.fast = magnitude > .85
+                if direction != self.direction:
+                    self.direction = direction
+                    self.next_repeat = now + .4
+                    return [direction]
+        return []
+
+    def tick(self, now):
+        if self.direction and now >= self.next_repeat:
+            self.next_repeat = now + (.07 if self.fast else .12)
+            return [self.direction]
+        return []
+
+
+def resolve_folder(primary, fallback, probe):
+    try:
+        probe(primary)
+        return primary, ''
+    except OSError:
+        probe(fallback)
+        return fallback, "C:\\Games isn't writable on this PC, so the game goes in your user folder instead."
+
+
+def legacy_exists(folder):
+    return any((folder / part).exists() for part in ('longshot_version.txt', '.heylisten-parts'))
+
+
+class ProgressEvents:
+    def __init__(self):
+        self.queue = queue.Queue()
+        self.cancelled = threading.Event()
+
+    def publish(self, kind, value):
+        self.queue.put((kind, value))
+
+    def cancel(self):
+        self.cancelled.set()
+
+
+class State(Enum):
+    STARTING = auto()
+    FIRST_RUN = auto()
+    NOT_INSTALLED = auto()
+    DOWNLOADING = auto()
+    READY = auto()
+    UPDATE_AVAILABLE = auto()
+    UPDATING = auto()
+    PLAYING = auto()
+    ERROR = auto()
+    RESTARTING = auto()
+
+
+class IllegalTransition(ValueError):
+    pass
+
+
+TRANSITIONS = {
+    State.STARTING: {State.FIRST_RUN, State.NOT_INSTALLED, State.READY},
+    State.FIRST_RUN: {State.NOT_INSTALLED, State.READY},
+    State.NOT_INSTALLED: {State.DOWNLOADING},
+    State.DOWNLOADING: {State.READY, State.ERROR, State.NOT_INSTALLED},
+    State.READY: {State.UPDATE_AVAILABLE, State.PLAYING, State.UPDATING, State.RESTARTING},
+    State.UPDATE_AVAILABLE: {State.UPDATING, State.PLAYING, State.RESTARTING},
+    State.UPDATING: {State.READY, State.ERROR, State.UPDATE_AVAILABLE},
+    State.PLAYING: {State.READY, State.UPDATE_AVAILABLE, State.ERROR},
+    State.ERROR: {State.NOT_INSTALLED, State.DOWNLOADING, State.READY, State.UPDATE_AVAILABLE, State.UPDATING},
+    State.RESTARTING: set(),
+}
+
+
+class App:
+    def __init__(self, state=State.STARTING):
+        self.state = state
+
+    def transition(self, state):
+        if state not in TRANSITIONS[self.state]:
+            raise IllegalTransition(f'{self.state.name} -> {state.name}')
+        self.state = state
+
+# ---------------------------------------------------------------- look
+# One logical canvas, a dark palette with a single warm accent, and a fixed type scale.
+CANVAS = (1280, 720)
+ACCENT = (232, 192, 112)
+ACCENT_INK = (24, 18, 8)
+INK = (238, 240, 243)
+INK_DIM = (168, 176, 184)
+INK_FAINT = (116, 124, 132)
+SURFACE = (14, 18, 23)
+SURFACE_HI = (36, 43, 52)
+SURFACE_FOCUS = (52, 61, 72)
+DANGER = (240, 128, 112)
+SUCCESS = (120, 204, 150)
+TYPE = {'display': ('segoeuib.ttf', 64), 'title': ('seguisb.ttf', 36), 'figure': ('segoeuil.ttf', 56),
+        'heading': ('seguisb.ttf', 22), 'body': ('segoeui.ttf', 20), 'button': ('seguisb.ttf', 20),
+        'cta': ('segoeuib.ttf', 24), 'caption': ('segoeui.ttf', 16), 'overline': ('seguisb.ttf', 14)}
+MARGIN = 96
+FOCUS_GAP = 5  # uniform space between a focused control and its accent outline
+
+
+def render_density(width, height):
+    """Physical pixels per logical pixel in SDL's aspect-preserving viewport."""
+    if width <= 0 or height <= 0:
+        return 1.0
+    return max(1.0, min(width / CANVAS[0], height / CANVAS[1]))
+
+
+def physical_span(span, scale, offset_x, offset_y):
+    x, y, w, h = span
+    left, top = round(x * scale), round(y * scale)
+    right, bottom = round((x + w) * scale), round((y + h) * scale)
+    return offset_x + left, offset_y + top, right - left, bottom - top
+
+
+class Painter:
+    """Measured text, rounded shapes and the backdrop; every string is fitted, never clipped."""
+
+    def __init__(self, s, ttf, renderer):
+        self.s, self.ttf, self.r = s, ttf, renderer
+        self.fonts, self.cache, self.backdrop = {}, {}, None
+        self.density = 0
+        self.set_density(1)
+        art = ROOT / 'assets' / 'ui-backdrop.bmp'
+        if art.is_file():
+            surface = s.SDL_LoadBMP(str(art).encode())
+            if surface:
+                self.backdrop = s.SDL_CreateTextureFromSurface(renderer, surface)
+                s.SDL_FreeSurface(surface)
+        s.SDL_SetRenderDrawBlendMode(renderer, s.SDL_BLENDMODE_BLEND)
+
+    def set_density(self, density):
+        density = max(1.0, round(density, 3))
+        if density == self.density:
+            return
+        fonts = Path(os.environ.get('WINDIR', r'C:\Windows')) / 'Fonts'
+        new_fonts = {}
+        try:
+            for role, (name, size) in TYPE.items():
+                font = None
+                for candidate in (name, 'segoeui.ttf'):
+                    font = self.ttf.TTF_OpenFont(str(fonts / candidate).encode(), max(1, round(size * density)))
+                    if font:
+                        break
+                if not font:
+                    raise RuntimeError('Could not open the system font')
+                new_fonts[role] = font
+        except Exception:
+            for font in new_fonts.values():
+                self.ttf.TTF_CloseFont(font)
+            raise
+        for texture, _, _ in self.cache.values():
+            self.s.SDL_DestroyTexture(texture)
+        self.cache.clear()
+        for font in self.fonts.values():
+            self.ttf.TTF_CloseFont(font)
+        self.fonts, self.density = new_fonts, density
+
+    def close(self):
+        for texture, _, _ in self.cache.values():
+            self.s.SDL_DestroyTexture(texture)
+        self.cache.clear()
+        if self.backdrop:
+            self.s.SDL_DestroyTexture(self.backdrop)
+        for font in self.fonts.values():
+            self.ttf.TTF_CloseFont(font)
+
+    # -- text
+    def _safe_char(self, role):
+        font = self.fonts.get(role)
+        for ch in ('·', '-', '.', '?', ' '):
+            if font is None or self.ttf.TTF_GlyphIsProvided(font, ord(ch)):
+                return ch
+        return '?'
+
+    def _sanitize(self, value, role):
+        """Replace any codepoint the loaded font lacks with a covered fallback (never tofu)."""
+        value = str(value)
+        font = self.fonts.get(role)
+        if font is None or all(ord(ch) < 128 for ch in value):
+            return value
+        safe = self._safe_char(role)
+        out = []
+        for ch in value:
+            if ord(ch) < 128 or self.ttf.TTF_GlyphIsProvided(font, ord(ch)):
+                out.append(ch)
+            else:
+                out.append(safe)
+        return ''.join(out)
+
+    def measure(self, role, value):
+        value = self._sanitize(value, role)
+        w, h = ctypes.c_int(), ctypes.c_int()
+        if self.ttf.TTF_SizeUTF8(self.fonts[role], str(value).encode('utf-8'), ctypes.byref(w), ctypes.byref(h)) != 0:
+            return 10 ** 6, 0
+        return w.value / self.density, h.value / self.density
+
+    def height(self, role):
+        return self.ttf.TTF_FontHeight(self.fonts[role]) / self.density
+
+    def fit(self, role, value, max_width):
+        value = str(value)
+        if self.measure(role, value)[0] <= max_width:
+            return value
+        lo, hi = 0, len(value)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if self.measure(role, value[:mid].rstrip() + '…')[0] <= max_width:
+                lo = mid
+            else:
+                hi = mid - 1
+        return value[:lo].rstrip() + '…' if self.measure(role, '…')[0] <= max_width else ''
+
+    def fit_middle(self, role, value, max_width):
+        """Paths keep their start and their end."""
+        value = str(value)
+        if self.measure(role, value)[0] <= max_width:
+            return value
+        lo, hi = 0, len(value)
+        clip = lambda n: value[:n - n // 2] + '…' + value[len(value) - n // 2:] if n else '…'
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if self.measure(role, clip(mid))[0] <= max_width:
+                lo = mid
+            else:
+                hi = mid - 1
+        return clip(lo) if self.measure(role, clip(lo))[0] <= max_width else ''
+
+    def wrap(self, role, value, max_width, max_lines=3):
+        lines, current = [], ''
+        for word in str(value).split():
+            trial = (current + ' ' + word).strip()
+            if current and self.measure(role, trial)[0] > max_width:
+                lines.append(current)
+                current = word
+            else:
+                current = trial
+        if current:
+            lines.append(current)
+        if len(lines) > max_lines:
+            lines = lines[:max_lines - 1] + [' '.join(lines[max_lines - 1:])]
+        return [self.fit(role, line, max_width) for line in lines]
+
+    def text(self, role, value, x, y, color=INK, max_width=None, align='left', alpha=255, middle=False, subpixel=False):
+        """Draw fitted text; returns the drawn width."""
+        s = self.s
+        value = str(value)
+        if max_width is not None:
+            value = (self.fit_middle if middle else self.fit)(role, value, max_width)
+        value = self._sanitize(value, role)
+        if not value:
+            return 0
+        key = (role, value, color, subpixel)
+        if key not in self.cache:
+            if len(self.cache) > 400:
+                for texture, _, _ in self.cache.values():
+                    s.SDL_DestroyTexture(texture)
+                self.cache.clear()
+            surface = self.ttf.TTF_RenderUTF8_Blended(self.fonts[role], value.encode('utf-8'), s.SDL_Color(*color, 255))
+            if not surface:
+                return 0
+            texture = s.SDL_CreateTextureFromSurface(self.r, surface)
+            if subpixel and texture:
+                s.SDL_SetTextureScaleMode(texture, s.SDL_ScaleModeLinear)
+            self.cache[key] = (texture, surface.contents.w, surface.contents.h)
+            s.SDL_FreeSurface(surface)
+        texture, pixel_w, pixel_h = self.cache[key]
+        w, h = pixel_w / self.density, pixel_h / self.density
+        if align == 'center':
+            x -= w // 2
+        elif align == 'right':
+            x -= w
+        s.SDL_SetTextureAlphaMod(texture, alpha)
+        if subpixel:
+            s.SDL_RenderCopyF(self.r, texture, None, s.SDL_FRect(x, y, w, h))
+            return w
+        if self.density > 1:
+            sx, sy = ctypes.c_float(), ctypes.c_float()
+            s.SDL_RenderGetScale(self.r, ctypes.byref(sx), ctypes.byref(sy))
+            if min(sx.value, sy.value) > 1 and s.SDL_RenderSetScale(self.r, 1, 1) == 0:
+                # Keep SDL's physical viewport and clip, but don't resample text.
+                try:
+                    rect = s.SDL_Rect(round(x * sx.value), round(y * sy.value), pixel_w, pixel_h)
+                    s.SDL_RenderCopy(self.r, texture, None, rect)
+                finally:
+                    s.SDL_RenderSetScale(self.r, sx.value, sy.value)
+                return w
+        s.SDL_RenderCopy(self.r, texture, None, s.SDL_Rect(int(x), int(y), int(round(w)), int(round(h))))
+        return w
+
+    # -- shapes
+    @staticmethod
+    def _inset(w, h, radius, row):
+        if radius <= 0:
+            return 0
+        if row < radius:
+            dy = radius - row - .5
+        elif row >= h - radius:
+            dy = row - (h - radius) + .5
+        else:
+            return 0
+        return radius - int(round(max(0.0, radius * radius - dy * dy) ** .5))
+
+    def _spans(self, spans, color, alpha):
+        s = self.s
+        if not spans:
+            return
+        s.SDL_SetRenderDrawColor(self.r, *color, int(max(0, min(255, alpha))))
+        width, height = ctypes.c_int(), ctypes.c_int()
+        if s.SDL_GetRendererOutputSize(self.r, ctypes.byref(width), ctypes.byref(height)) != 0:
+            return
+        scale = min(width.value / CANVAS[0], height.value / CANVAS[1])
+        if scale <= 0:
+            return
+        ox = round((width.value - CANVAS[0] * scale) / 2)
+        oy = round((height.value - CANVAS[1] * scale) / 2)
+        rects = (s.SDL_Rect * len(spans))(*[s.SDL_Rect(*physical_span(span, scale, ox, oy)) for span in spans])
+        s.SDL_RenderSetLogicalSize(self.r, 0, 0)
+        s.SDL_RenderFillRects(self.r, rects, len(spans))
+        s.SDL_RenderSetLogicalSize(self.r, *CANVAS)
+
+    def fill(self, x, y, w, h, color, alpha=255, radius=0):
+        x, y, w, h = int(x), int(y), int(w), int(h)
+        if w <= 0 or h <= 0:
+            return
+        radius = min(int(radius), w // 2, h // 2)
+        spans = [(x, y + radius, w, h - 2 * radius)] if h > 2 * radius else []
+        for row in list(range(radius)) + list(range(h - radius, h)):
+            inset = self._inset(w, h, radius, row)
+            spans.append((x + inset, y + row, w - 2 * inset, 1))
+        self._spans(spans, color, alpha)
+
+    @staticmethod
+    def _row_extent(cy, x0, y0, x1, y1, rad):
+        """Horizontal extent of a rounded rect at scanline `cy` (device space), or None."""
+        if cy < y0 or cy > y1:
+            return None
+        if cy < y0 + rad:
+            k = (y0 + rad) - cy
+            arc = math.sqrt(max(0.0, rad * rad - k * k))
+            return (x0 + rad) - arc, (x1 - rad) + arc
+        if cy > y1 - rad:
+            k = cy - (y1 - rad)
+            arc = math.sqrt(max(0.0, rad * rad - k * k))
+            return (x0 + rad) - arc, (x1 - rad) + arc
+        return x0, x1
+
+    def ring(self, x, y, w, h, color, alpha=255, radius=0, thickness=2):
+        """Even, crisp rounded outline rasterized in device pixels.
+
+        Computing the stroke per device row (instead of scaling logical spans) keeps the
+        stroke weight and the corner arcs uniform at fractional DPI -- no scale stripes.
+        """
+        s = self.s
+        width, height = ctypes.c_int(), ctypes.c_int()
+        if s.SDL_GetRendererOutputSize(self.r, ctypes.byref(width), ctypes.byref(height)) != 0:
+            return
+        scale = min(width.value / CANVAS[0], height.value / CANVAS[1])
+        if scale <= 0:
+            return
+        ox = round((width.value - CANVAS[0] * scale) / 2)
+        oy = round((height.value - CANVAS[1] * scale) / 2)
+        x0, y0 = x * scale, y * scale
+        x1, y1 = (x + w) * scale, (y + h) * scale
+        if x1 <= x0 or y1 <= y0:
+            return
+        rad = min(radius * scale, (x1 - x0) / 2, (y1 - y0) / 2)
+        th = max(1.0, thickness * scale)
+        inner_rad = max(0.0, rad - th)
+        spans = []
+        for dy in range(int(math.floor(y0)), int(math.ceil(y1))):
+            cy = dy + 0.5
+            outer = self._row_extent(cy, x0, y0, x1, y1, rad)
+            if outer is None:
+                continue
+            inner = self._row_extent(cy, x0 + th, y0 + th, x1 - th, y1 - th, inner_rad)
+            segs = [(outer[0], outer[1])] if inner is None else [(outer[0], inner[0]), (inner[1], outer[1])]
+            for a, b in segs:
+                pa, pb = int(round(a)), int(round(b))
+                if pb > pa:
+                    spans.append((ox + pa, oy + dy, pb - pa, 1))
+        if not spans:
+            return
+        s.SDL_SetRenderDrawColor(self.r, *color, int(max(0, min(255, alpha))))
+        rects = (s.SDL_Rect * len(spans))(*[s.SDL_Rect(*span) for span in spans])
+        s.SDL_RenderSetLogicalSize(self.r, 0, 0)
+        s.SDL_RenderFillRects(self.r, rects, len(spans))
+        s.SDL_RenderSetLogicalSize(self.r, *CANVAS)
+
+    def circle(self, cx, cy, radius, color, alpha=255):
+        self.fill(cx - radius, cy - radius, 2 * radius, 2 * radius, color, alpha, radius)
+
+    def scene(self, scrim=0):
+        """Key-art backdrop (or a plain dark fill), optionally dimmed for dense screens."""
+        s = self.s
+        s.SDL_SetRenderDrawColor(self.r, *SURFACE, 255)
+        s.SDL_RenderClear(self.r)
+        if self.backdrop:
+            s.SDL_RenderCopy(self.r, self.backdrop, None, None)
+        if scrim:
+            self.fill(0, 0, *CANVAS, SURFACE, scrim)
+
+
+class LauncherUI:
+    def __init__(self, startup_error=None):
+        self.profile = Path(os.environ.get('USERPROFILE', str(Path.home())))
+        self.primary = Path(r'C:\Games') / 'sable-loop-game'
+        self.fallback = self.profile / 'Games' / 'sable-loop-game'
+        self.legacy = self.fallback
+        try:
+            self.config = json.loads(CONFIG.read_text(encoding='utf-8-sig'))
+        except (OSError, ValueError):
+            self.config = {}
+        self.folder = self.fallback if startup_error is not None else resolve_game_folder()
+        self.screen = 'main' if self.config else 'folder'
+        self.state = State.READY if installed(self.folder) else State.NOT_INSTALLED
+        self.focus = 0
+        self.reduce_motion = not windows_animations_enabled()
+        self.status = 'Checking for updates…'
+        self.progress = ''
+        self.progress_info = {}
+        self._game_progress_pct = 0
+        self.game_completion_until = None
+        self.events = ProgressEvents()
+        self.mapper = InputMapper()
+        self.controllers = {}
+        self.operation = None
+        self.axis = [0.0, 0.0]
+        self.running = True
+        self.last_error = ''
+        self.tool_update_available = False
+        self.tool_handoff_started = False
+        self._own_game_process = None
+        self._own_game_exe = None
+        self._external_game_exe = None
+        self._external_game_folder = None
+        self._window_requests = []
+        self._window_control = WindowController()
+        self._watch = None
+        self._watch_folder = None
+        self._watch_exe = None
+        self._target_cache = None
+        self.quit_button = None
+        self.quit_hover = False
+        self.gfx_values, self.gfx_picker, self.gfx_return, self.gfx_dlss_ok = {}, None, 0, True
+        self.gfx_options, self.gfx_schema = game_settings.OPTIONS, game_settings.BY_KEY
+        if self.state == State.READY and getattr(sys, 'frozen', False) and '--screenshot' not in sys.argv:
+            threading.Thread(target=self.shortcut_worker, daemon=True).start()
+        if startup_error is None:
+            self.check_updates()
+
+    def save(self):
+        persisted = defender_config()
+        for key in ('defender_state', 'defender_path'):
+            if key in persisted:
+                self.config[key] = persisted[key]
+        self.config['game_dir'] = str(self.folder)
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = CONFIG.with_suffix('.tmp')
+        tmp.write_text(json.dumps(self.config), encoding='utf-8')
+        os.replace(tmp, CONFIG)
+
+    def check_updates(self):
+        events = self.events
+        def check():
+            try:
+                events.publish('status', 'Fetching manifest…')
+                from curl_cffi import requests as curl_requests, CurlOpt
+                options = {CurlOpt.CONNECTTIMEOUT_MS: 10000, CurlOpt.TIMEOUT_MS: 0,
+                           CurlOpt.LOW_SPEED_LIMIT: 1024, CurlOpt.LOW_SPEED_TIME: 30}
+                for attempt in range(2):
+                    try:
+                        with curl_requests.Session(impersonate='chrome', curl_options=options) as client:
+                            manifest = fetch_channel_manifest(self.folder, client)
+                            events.publish('status', 'Planning…')
+                        break
+                    except Exception as exc:
+                        log_message('Game channel attempt failed:\n' + traceback.format_exc())
+                        if attempt or isinstance(exc, (ValueError, TimeoutError)):
+                            raise
+                        events.publish('status', 'Connection stalled — retrying…')
+                digest = manifest_digest(manifest)
+                events.publish('check', (manifest.get('revision'), digest))
+            except Exception as exc:
+                log_message('Game channel check failed:\n' + traceback.format_exc())
+                events.publish('offline', channel_error_message(exc))
+            try:
+                events.publish('status', 'Checking for updates…')
+                from curl_cffi import requests as curl_requests
+                for attempt in range(2):
+                    try:
+                        response = curl_requests.get('https://api.github.com/repos/cputroll/sable-loop/releases/latest', headers={'User-Agent':'sable-loop', 'Accept':'application/vnd.github+json'}, timeout=(10, 60))
+                        try:
+                            response.raise_for_status()
+                            release = response.json()
+                        finally:
+                            response.close()
+                        break
+                    except Exception:
+                        log_message('Update check attempt failed:\n' + traceback.format_exc())
+                        if attempt:
+                            raise
+                        events.publish('status', 'Connection stalled — retrying…')
+                events.publish('tool_check', release.get('tag_name', 'unknown'))
+                if installed(self.folder):
+                    script = resolve_update_script(BASE)
+                    if script is None:
+                        raise FileNotFoundError('Update-Game.ps1 not found')
+                    result = subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-File', str(script), '-DryRun', '-GameFolder', str(self.folder)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+                    events.publish('upstream_check', result.returncode)
+            except Exception:
+                log_message('Update check failed:\n' + traceback.format_exc())
+                events.publish('offline', 'Could not reach the update server')
+        threading.Thread(target=check, daemon=True).start()
+
+    def buttons(self):
+        if self.screen == 'folder':
+            return (['Update now'] if self.tool_update_available else []) + (['Use existing folder'] if legacy_exists(self.legacy) else []) + ['Use default folder', 'Choose another folder', 'Continue']
+        if self.screen == 'settings':
+            return ['Change game folder', 'Speed up installs (one Windows permission, instant)', 'Graphics', 'Desktop shortcut: ' + ('On' if self.config.get('shortcut', True) else 'Off'), 'Check for updates automatically: ' + ('On' if self.config.get('auto_tool_update', True) else 'Off'), 'Check for updates now', 'View log', 'Back']
+        if self.screen == 'graphics':
+            if self.gfx_picker is not None:
+                opt = self.gfx_schema[self.gfx_picker]
+                return [game_settings.display_value(opt, v, self.gfx_values, self.gfx_schema)
+                        for v in self.gfx_allowed(opt.key)]
+            return list(self.GFX_ACTIONS) + [o.label for o in self.gfx_options]
+        if self.screen == 'progress':
+            return [] if self.operation == 'tool' or self.game_completion_until is not None else ['Cancel']
+        if self.screen == 'error':
+            return ['Retry', 'View log', 'Back']
+        if self.screen == 'update':
+            return ['Update now', 'Later']
+        if self.state == State.PLAYING:
+            return ['Quit game', 'Settings']
+        if self.tool_update_available:
+            return ['Update now', 'Settings']
+        return (['Play', 'Update', 'Settings'] if self.state in (State.READY, State.UPDATE_AVAILABLE) else ['Download', 'Settings'])
+
+    def set_screen(self, screen):
+        self.screen, self.focus = screen, 0
+        self.hover = None
+        self.settings_first = 0
+
+    # ---------------------------------------------------------------- graphics
+    GFX_ACTIONS = ('Recommended for this PC', 'Reset to game defaults', 'Back')
+    GFX_PICKER_MIN = 7  # options with more values than this open a value list on A
+
+    def enter_graphics(self):
+        try:
+            self.gfx_values = game_settings.read_values(self.folder)
+        except OSError as exc:
+            self.last_error = f'Could not read the game settings: {exc}'
+            self.set_screen('error')
+            return
+        self.gfx_dlss_ok = game_settings.dlss_available(self.folder)
+        self.gfx_options = game_settings.options_for(self.folder)
+        self.gfx_schema = game_settings.BY_KEY_043 if self.gfx_options is game_settings.OPTIONS_043 else game_settings.BY_KEY
+        self.gfx_picker = None
+        self.set_screen('graphics')
+        self.focus = len(self.GFX_ACTIONS)
+        self.status = 'Saved to the game at once. In game: F1 or Insert opens its menu; its last row, Quit (A twice), exits the game.'
+
+    def leave_graphics(self):
+        self.gfx_picker = None
+        self.set_screen('settings')
+        self.focus = 2
+
+    def gfx_option(self, index=None):
+        index = self.focus if index is None else index
+        index -= len(self.GFX_ACTIONS)
+        return self.gfx_options[index] if 0 <= index < len(self.gfx_options) else None
+
+    def gfx_allowed(self, key):
+        return game_settings.allowed(key, self.gfx_dlss_ok, schema=self.gfx_schema, current=self.gfx_values)
+
+    def gfx_write(self, key, value):
+        try:
+            self.gfx_values = game_settings.set_value(self.folder, key, value, self.gfx_values)
+            opt = self.gfx_schema[key]
+            self.status = f'{opt.label}: {opt.text(self.gfx_values[key])}' + (' · applies after a restart' if opt.restart else ' · saved')
+        except OSError as exc:
+            self.status = f"Couldn't save: {exc}"
+
+    def gfx_step(self, direction):
+        opt = self.gfx_option()
+        if opt:
+            self.gfx_write(opt.key, game_settings.cycle(opt.key, self.gfx_values.get(opt.key, opt.default), direction,
+                                                       self.gfx_dlss_ok, schema=self.gfx_schema, current=self.gfx_values))
+
+    def gfx_apply_recommended(self):
+        def work():
+            try:
+                preset, why = game_settings.choose_preset(self.folder)
+                game_settings.write_values(self.folder, preset)
+                self.events.publish('graphics', ('Recommended applied: ' + why.split('-> ')[-1], game_settings.read_values(self.folder)))
+            except Exception as exc:
+                self.events.publish('graphics', (f"Couldn't apply the recommended settings: {exc}", None))
+        self.status = 'Detecting your graphics card…'
+        threading.Thread(target=work, daemon=True).start()
+
+    def gfx_activate(self):
+        buttons = self.buttons()
+        if not buttons:
+            return
+        if self.gfx_picker is not None:
+            values = self.gfx_allowed(self.gfx_picker)
+            self.gfx_write(self.gfx_picker, values[min(self.focus, len(values) - 1)])
+            self.gfx_picker, self.focus = None, self.gfx_return
+            return
+        choice = buttons[self.focus]
+        if choice == 'Back':
+            self.leave_graphics()
+        elif choice == 'Reset to game defaults':
+            try:
+                self.gfx_values = game_settings.reset_defaults(self.folder)
+                self.status = "Game defaults restored (your controls and bindings are kept)."
+            except OSError as exc:
+                self.status = f"Couldn't save: {exc}"
+        elif choice == 'Recommended for this PC':
+            self.gfx_apply_recommended()
+        else:
+            opt = self.gfx_option()
+            values = self.gfx_allowed(opt.key)
+            if len(values) > self.GFX_PICKER_MIN:
+                current = self.gfx_values.get(opt.key, opt.default)
+                self.gfx_picker, self.gfx_return = opt.key, self.focus
+                self.focus = values.index(current) if current in values else 0
+            else:
+                self.gfx_step(1)
+
+    def gfx_action(self, action):
+        """Graphics-only input; returns True when handled."""
+        if action in ('left', 'right'):
+            if self.gfx_picker is None:
+                if self.gfx_option():
+                    self.gfx_step(1 if action == 'right' else -1)
+                else:
+                    self.focus = max(0, min(len(self.GFX_ACTIONS) - 1, self.focus + (1 if action == 'right' else -1)))
+            return True
+        if action in ('back', 'cancel', 'menu'):
+            if self.gfx_picker is not None:
+                self.gfx_picker, self.focus = None, self.gfx_return
+            else:
+                self.leave_graphics()
+            return True
+        return False
+
+    def start_tool_update(self):
+        if self.operation == 'tool' and self.screen == 'progress':
+            return
+        self.operation = 'tool'
+        self.progress = 'Updating HeyListen…'
+        self.set_screen('progress')
+        args = [arg for arg in sys.argv[1:] if arg not in ('--self-update', '--no-self-update')]
+        if not args:
+            args = ['--gui']
+        threading.Thread(target=tool_update_worker, args=(self.events, args), daemon=True).start()
+
+    def start_operation(self, update=False):
+        self.operation = 'update' if update else 'download'
+        self._game_progress_pct = 0
+        self.game_completion_until = None
+        self.__dict__.setdefault('anim', {}).pop('game_bar', None)
+        try:
+            probe_writable(self.folder)
+            # The installer checks free space after verifying existing files and cache.
+            # A fixed preflight here wrongly blocks already-complete installations.
+            self.save()
+        except OSError as exc:
+            self.last_error = str(exc)
+            self.set_screen('error')
+            return
+        self.progress = 'Preparing update' if update else 'Preparing installation'
+        self.progress_info = {}
+        self.state = State.UPDATING if update else State.DOWNLOADING
+        self.events = ProgressEvents()
+        # Channel updates reconcile the destination manifest, not the legacy builder.
+        args = ['--no-self-update', '--install-game', str(self.folder)]
+        if update:
+            args.append('--no-preset')
+        if _TEST_GAME_MANIFEST and not update:
+            args += ['--game-manifest', _TEST_GAME_MANIFEST]
+        self.set_screen('progress')
+        threading.Thread(target=worker_command, args=(self.events, args), daemon=True).start()
+
+    _TARGET_CACHE_TTL = 5.0
+
+    def _request_window(self, state):
+        self._window_requests.append(state)
+
+    def _on_window_restored(self):
+        self._window_control.observe('normal')
+        if self.state == State.PLAYING:
+            if self.screen in ('main', 'settings', 'folder', 'error', 'update'):
+                self.quit_button = top_right(CANVAS[0], MARGIN)
+            if self.screen == 'main':
+                self.focus = 0
+
+    def _cached_play_target(self, now=None, force=False):
+        now = time.monotonic() if now is None else now
+        cached = self._target_cache
+        if not force and cached is not None and cached[0] == self.folder and now < cached[1]:
+            return cached[2]
+        target = game_play_target(self.folder)
+        self._target_cache = (self.folder, now + self._TARGET_CACHE_TTL, target)
+        return target
+
+    def _game_watch(self):
+        # While an external game is being tracked, keep polling its exact watch
+        # through exit even if the folder changes or target lookup fails.
+        if (self._own_game_process is None
+                and (self._external_game_exe is not None
+                     or (self.state == State.PLAYING and self._watch is not None and self._watch.running))):
+            if self._watch is not None:
+                return self._watch
+            watch_folder = self._external_game_folder or self.folder
+            self._watch_folder = watch_folder
+            self._watch_exe = self._external_game_exe
+            self._watch = game_state.GameWatch(watch_folder, started=self._external_game_started,
+                                               ended=self._external_game_ended, exe=self._external_game_exe,
+                                               initial_running=True)
+            return self._watch
+        target = self._cached_play_target()
+        if target is None:
+            self._watch = None
+            self._watch_folder = None
+            self._watch_exe = None
+            return None  # No game installed here; nothing to watch.
+        if self._watch is None or self._watch_folder != self.folder or self._watch_exe != str(target):
+            self._watch_folder = self.folder
+            self._watch_exe = str(target)
+            self._watch = game_state.GameWatch(self.folder, started=self._external_game_started,
+                                               ended=self._external_game_ended, exe=str(target))
+        return self._watch
+
+    def _watch_should_poll(self):
+        if self._own_game_process is not None:
+            return False
+        if self.operation in ('download', 'update', 'tool'):
+            return False
+        if self._external_game_exe is not None or self.state == State.PLAYING:
+            return True
+        return self.operation in (None, 'check') and self.state in (State.READY, State.UPDATE_AVAILABLE)
+
+    def _external_game_started(self, exe):
+        if self._own_game_process is None and self.operation in (None, 'check') and self.state in (State.READY, State.UPDATE_AVAILABLE):
+            if hasattr(self, 'close_controllers'):
+                try: self.close_controllers()
+                except Exception: pass
+            self._external_game_exe = exe
+            self._external_game_folder = self._watch_folder or self.folder
+            self.state = State.PLAYING
+            self.status = 'Playing...'
+            self.set_screen('main')
+            self.quit_button = top_right(CANVAS[0], MARGIN)
+            self._request_window('minimized')
+
+    def _external_game_ended(self):
+        if self._own_game_process is None and (self.state == State.PLAYING or self._external_game_exe is not None):
+            self._external_game_exe = None
+            self._external_game_folder = None
+            self.events.publish('game_done', None)
+
+    def _quit_game(self):
+        process = self._own_game_process
+        if process is not None:
+            if process.poll() is not None:
+                return
+            exe = self._own_game_exe
+            if not exe:
+                target = self._cached_play_target()
+                exe = str(target) if target is not None else None
+            if not exe:
+                return
+            try:
+                if game_state.close_game(self.folder, exe, pid=process.pid):
+                    self.status = 'Closing game…'
+            except Exception as exc:
+                log_message(f'Quit game: {exc}')
+            return
+        try:
+            folder = self._external_game_folder or self.folder
+            exe = self._external_game_exe
+            if not exe:
+                target = self._cached_play_target()
+                if target is None:
+                    return
+                exe = str(target)
+            if game_state.close_game(folder, exe):
+                self.status = 'Closing game…'
+        except Exception as exc:
+            log_message(f'Quit game: {exc}')
+
+    def activate(self):
+        if self.screen == 'graphics':
+            return self.gfx_activate()
+        buttons = self.buttons()
+        if not buttons:
+            return
+        choice = buttons[self.focus]
+        if choice == 'Play':
+            try:
+                if hasattr(self, 'close_controllers'):
+                    self.close_controllers()
+                target = game_play_target(self.folder)
+                if target is None:
+                    raise OSError('The game could not be found. Install it again from the launcher.')
+                process = subprocess.Popen([str(target)], cwd=str(self.folder))
+                self._own_game_process = process
+                self._own_game_exe = str(target)
+                self._request_window('minimized')
+                try:
+                    threading.Thread(target=watch_controller_combo, args=(process, self.folder), daemon=True).start()
+                except Exception as exc:
+                    log_message(f'Controller menu watcher: {exc}')
+                self.state = State.PLAYING
+                self.status = 'Playing...'
+                self.focus = 0
+                self.quit_button = top_right(CANVAS[0], MARGIN)
+                def wait_game():
+                    process.wait()
+                    self.events.publish('game_done', None)
+                threading.Thread(target=wait_game, daemon=True).start()
+            except OSError as exc:
+                if hasattr(self, 'open_controllers'):
+                    self.open_controllers()
+                self.last_error = str(exc)
+                self.set_screen('error')
+        elif choice == 'Quit game': self._quit_game()
+        elif choice == 'Download': self.start_operation()
+        elif choice == 'Update': self.set_screen('update')
+        elif choice == 'Update now':
+            if self.tool_update_available: self.start_tool_update()
+            else: self.start_operation(True)
+        elif choice in ('Settings',): self.set_screen('settings')
+        elif choice in ('Back', 'Later'): self.set_screen('main')
+        elif choice == 'Cancel': terminate_worker(self.events)
+        elif choice == 'Retry':
+            if self.operation == 'startup':
+                try:
+                    self.folder = resolve_game_folder()
+                    if relocate_launcher(self.folder):
+                        self.running = False
+                    else:
+                        self.operation = None
+                        self.set_screen('main' if self.config else 'folder')
+                        self.check_updates()
+                except Exception as exc:
+                    self.last_error = str(exc)
+                    log_message(f'Startup retry: {exc}')
+                return
+            if self.operation == 'check':
+                self.operation = None
+                self.status = 'Checking for updates…'
+                self.set_screen('main')
+                self.check_updates()
+            elif self.operation == 'tool': self.start_tool_update()
+            else: self.start_operation(self.operation == 'update')
+        elif choice == 'View log':
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            LOG.touch(exist_ok=True)
+            os.startfile(LOG)
+        elif choice == 'Speed up installs (one Windows permission, instant)':
+            try:
+                self.status = 'Added' if optimize_defender(self.folder) else 'Windows declined'
+            except Exception:
+                self.status = 'Unavailable'
+        elif choice == 'Change game folder': self.set_screen('folder')
+        elif choice == 'Graphics': self.enter_graphics()
+        elif choice.startswith('Desktop shortcut'):
+            enabled = not self.config.get('shortcut', True)
+            try:
+                create_shortcut(self.folder, enabled)
+                self.config['shortcut'] = enabled
+                self.save()
+            except Exception as exc:
+                self.last_error = str(exc)
+                self.set_screen('error')
+        elif choice.startswith('Check for updates automatically:'):
+            self.config['auto_tool_update'] = not self.config.get('auto_tool_update', True)
+            self.save()
+        elif choice == 'Check for updates now': self.check_updates()
+        elif choice == 'Use existing folder': self.folder = self.legacy
+        elif choice == 'Use default folder':
+            try:
+                self.folder, self.status = resolve_folder(self.primary, self.fallback, probe_writable)
+            except OSError as exc:
+                self.last_error = str(exc)
+                self.set_screen('error')
+        elif choice == 'Choose another folder':
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk(); root.withdraw()
+            path = filedialog.askdirectory(parent=root)
+            root.destroy()
+            if path: self.folder = Path(path)
+        elif choice == 'Continue':
+            try:
+                if self.folder == self.primary:
+                    self.folder, self.status = resolve_folder(self.primary, self.fallback, probe_writable)
+                else: probe_writable(self.folder)
+                previous = load_game_folder()
+                self.save()
+                if getattr(sys, 'frozen', False) and relocate_launcher(self.folder):
+                    current = Path(sys.executable).resolve()
+                    fallback = Path(os.environ.get('LOCALAPPDATA', str(Path.home()))) / 'Programs' / 'Ocarina of Time'
+                    if current.name.casefold() == 'ocarina of time.exe' and (previous and current.parent == previous.resolve() or current.parent == fallback.resolve()) and current.parent != self.folder.resolve():
+                        schedule_owned_cleanup()
+                    self.running = False
+                    return
+                self._target_cache = None
+                if self.state != State.PLAYING:
+                    self.state = State.READY if installed(self.folder) else State.NOT_INSTALLED
+                self.set_screen('main')
+            except OSError as exc:
+                self.last_error = str(exc)
+                self.set_screen('error')
+
+    def pointer(self, x, y, click=False):
+        """Track hover separately; only a click moves keyboard/controller focus."""
+        self.quit_hover = False
+        button = getattr(self, 'quit_button', None)
+        if button is not None:
+            if button.visible(self.state == State.PLAYING) and button.hit(x, y):
+                self.hover = None
+                self.quit_hover = True
+                if click:
+                    self._quit_game()
+                return
+            if button.hit(x, y):
+                self.hover = None
+                return  # Inactive quit area still never selects rows behind it.
+        self.hover = None
+        for hx, hy, hw, hh, index in self.hits:
+            if hx <= x < hx + hw and hy <= y < hy + hh and index < len(self.buttons()):
+                if not (self.screen == 'progress' and self.operation == 'tool'):
+                    self.hover = index
+                    if click:
+                        self.focus = index
+                        self.activate()
+                break
+
+    def action(self, action):
+        if self.screen == 'progress' and (self.operation == 'tool' or self.game_completion_until is not None):
+            return
+        if self.screen == 'graphics' and self.gfx_action(action):
+            return
+        if action == 'up': self.focus = max(0, self.focus - 1)
+        elif action == 'down': self.focus = min(len(self.buttons()) - 1, self.focus + 1)
+        elif action == 'accept': self.activate()
+        elif action == 'menu' and self.screen != 'progress': self.set_screen('main' if self.screen == 'settings' else 'settings')
+        elif action in ('back', 'cancel'):
+            if self.screen == 'progress' and self.operation != 'tool': terminate_worker(self.events)
+            elif self.screen != 'main': self.set_screen('main')
+
+    @property
+    def game_progress_pct(self):
+        return self._game_progress_pct if self.screen == 'progress' and self.operation in GAME_OPERATIONS else None
+
+    def drain(self):
+        while True:
+            try: kind, value = self.events.queue.get_nowait()
+            except queue.Empty: break
+            if kind == 'status': self.status = str(value)
+            elif kind == 'progress':
+                install_record = isinstance(value, dict) and 'install_pct' in value
+                if self.operation in GAME_OPERATIONS:
+                    if self.game_completion_until is None:
+                        if install_record:
+                            self._game_progress_pct = max(self._game_progress_pct, value['install_pct'])
+                        phase = game_progress_phase(value)
+                        if phase:
+                            self.progress = phase
+                            self.progress_info = {'game_detail': game_progress_detail(value)}
+                            if value.get('phase') == 'Downloading':
+                                received = value.get('rate_received_at')
+                                self.progress_info['game_detail_until'] = (
+                                    time.monotonic() if received is None else received) + GAME_RATE_TIMEOUT
+                    continue
+                if install_record or (isinstance(value, dict) and 'install_stage' in value):
+                    continue
+                self.progress = value.get('text', str(value)) if isinstance(value, dict) else str(value)
+                if isinstance(value, dict) and 'done' in value:
+                    self.progress_info = value
+                elif isinstance(value, dict) and value.get('text'):
+                    match = re.search(r'(\d{1,3})%', value['text'])
+                    if match and not self.progress_info.get('total'):
+                        self.progress_info = dict(self.progress_info, pct=min(100, int(match.group(1))))
+            elif kind == 'complete':
+                if self.operation not in GAME_OPERATIONS or self.game_completion_until is not None:
+                    continue
+                if value != 0 or not installed(self.folder):
+                    self.last_error = 'The game could not be found after installation. Select Retry to repair it.'
+                    self.state = State.ERROR
+                    self.set_screen('error')
+                    continue
+                self.state = State.READY
+                self.status = 'Ready to play.'
+                self.progress = 'Ready to play'
+                self._target_cache = None
+                self._game_progress_pct = 100
+                self.game_completion_until = time.monotonic() + .75
+                self.set_screen('progress')
+                self.install_registration = threading.Thread(target=self.shortcut_worker, daemon=True)
+                self.install_registration.start()
+                if self.operation == 'download':
+                    play_install_chime()
+            elif kind == 'cancelled':
+                self.state = State.NOT_INSTALLED
+                self.status = 'Stopped. Run DOWNLOAD to resume.'
+                self.set_screen('main')
+            elif kind == 'error':
+                self.last_error = str(value)
+                self.state = State.ERROR
+                self.set_screen('error')
+            elif kind == 'game_done':
+                self.state = State.READY
+                self.status = 'Ready to play.'
+                self._own_game_process = None
+                self._own_game_exe = None
+                self._external_game_exe = None
+                self._external_game_folder = None
+                self.quit_button = None
+                self.quit_hover = False
+                self._request_window('normal')
+                self.check_updates()
+            elif kind == 'offline':
+                if self.operation not in ('download', 'update', 'tool'):
+                    if self.state == State.PLAYING:
+                        self.status = str(value or 'Could not reach the update server')
+                    else:
+                        self.last_error = str(value or 'Could not reach the update server')
+                        self.operation = 'check'
+                        self.set_screen('error')
+            elif kind == 'check':
+                revision, digest = value
+                self.latest_manifest_hash = digest
+                if self.state == State.READY and installed_manifest_digest(self.folder) != digest:
+                    self.state = State.UPDATE_AVAILABLE
+                    self.status = 'A game data update may be available.'
+                    if self.operation is None and self.screen == 'main':
+                        self.start_operation(True)
+                else: self.status = 'Game data: ' + (str(revision) if revision is not None else 'unversioned')
+            elif kind == 'tool_check':
+                match = re.fullmatch(r'v(\d+)\.(\d+)\.(\d+)', value)
+                if match and tuple(map(int, match.groups())) > tuple(map(int, APP_VERSION.split('.'))):
+                    self.tool_update_available = True
+                    self.status = 'HeyListen update available: ' + value
+                    if self.operation in ('game', 'download', 'update'):
+                        try:
+                            STATE_DIR.mkdir(parents=True, exist_ok=True)
+                            with LOG.open('a', encoding='utf-8') as log:
+                                log.write('Automatic tool update deferred during game operation.\n')
+                        except OSError:
+                            pass
+                    elif self.config.get('auto_tool_update', True) and self.screen != 'progress' and '--no-self-update' not in sys.argv and not self.tool_handoff_started:
+                        self.tool_handoff_started = True
+                        self.start_tool_update()
+                elif match:
+                    self.tool_update_available = False
+                    self.status = 'HeyListen is up to date.'
+            elif kind == 'tool_complete':
+                # The child must exit first; its helper then waits for this GUI to exit before swapping.
+                self.running = False
+            elif kind == 'tool_current':
+                self.tool_update_available = False
+                self.operation = None
+                self.status = 'HeyListen is up to date.'
+                self.set_screen('main')
+            elif kind == 'graphics':
+                message, values = value
+                self.status = message
+                if values:
+                    self.gfx_values = values
+            elif kind == 'upstream_check' and value == 10:
+                self.status = 'An upstream builder update is available.'
+        if self.game_completion_until is not None and time.monotonic() >= self.game_completion_until:
+            self.game_completion_until = None
+            self.operation = None
+            self.set_screen('main')
+
+    def shortcut_worker(self):
+        actions = ([lambda: create_shortcut(self.folder)] if self.config.get('shortcut', True) else [])
+        actions.append(lambda: register_install(self.folder))
+        for action in actions:
+            try:
+                action()
+            except Exception as exc:
+                STATE_DIR.mkdir(parents=True, exist_ok=True)
+                with LOG.open('a', encoding='utf-8') as log: log.write('Shortcut: ' + str(exc) + '\n')
+
+    # ---------------------------------------------------------------- drawing
+    def free_space_text(self):
+        now = time.monotonic()
+        cached = getattr(self, '_free_cache', None)
+        if cached and cached[0] == self.folder and now - cached[1] < 2:
+            return cached[2]
+        parent = self.folder
+        while not parent.exists() and parent != parent.parent: parent = parent.parent
+        try: value = f'{shutil.disk_usage(parent).free / 1e9:.1f} GB free · space needed is checked before download'
+        except OSError: value = ''
+        self._free_cache = (self.folder, now, value)
+        return value
+
+    def ease(self, key, target, dt, rate=0.035):
+        """Exponential approach: ~95% of the way in about 105 ms."""
+        anim = self.__dict__.setdefault('anim', {})
+        current = anim.get(key, target)
+        if getattr(self, 'snap', False) or dt <= 0:
+            current = target
+        else:
+            current += (target - current) * (1 - math.exp(-dt / rate))
+            if abs(current - target) < .5:
+                current = target
+        anim[key] = current
+        return current
+
+    def row_spec(self, label):
+        """Split a settings label into (text, value, toggle) for display."""
+        for prefix in ('Desktop shortcut', 'Check for updates automatically'):
+            if label.startswith(prefix + ':'):
+                return prefix, None, label.endswith('On')
+        if label.startswith('Speed up installs'):
+            return 'Speed up installs', 'One Windows permission', None
+        if label == 'Change game folder':
+            return 'Game folder', str(self.folder), None
+        return label, None, None
+
+    def draw_rows(self, p, labels, x, y, w, h, gap, dt, first=0):
+        """Stacked rows with independent focus and hover; registers mouse targets."""
+        for i, _ in enumerate(labels):
+            hovered = getattr(self, 'hover', None) == first + i
+            p.fill(x, y + i * (h + gap), w, h, SURFACE_FOCUS if hovered else SURFACE_HI, 220 if hovered else 165, 10)
+        if first <= self.focus < first + len(labels):
+            fy = y + (self.focus - first) * (h + gap)
+            p.fill(x, fy, w, h, SURFACE_FOCUS, 255, 10)
+            p.ring(x - FOCUS_GAP, fy - FOCUS_GAP, w + 2 * FOCUS_GAP, h + 2 * FOCUS_GAP, ACCENT, 255, 10 + FOCUS_GAP, 2)
+        for i, label in enumerate(labels):
+            index, top = first + i, y + i * (h + gap)
+            focused = index == self.focus
+            self.hits.append((x, top, w, h, index))
+            text, value, toggle = self.row_spec(label)
+            right = x + w - 20
+            if toggle is not None:
+                tw, th = 46, 26
+                tx, ty = right - tw, top + (h - th) // 2
+                p.fill(tx, ty, tw, th, ACCENT if toggle else (72, 80, 90), 255, th // 2)
+                p.circle(tx + (tw - th // 2 if toggle else th // 2), ty + th // 2, th // 2 - 4, ACCENT_INK if toggle else INK)
+                p.text('caption', 'On' if toggle else 'Off', tx - 12, top + (h - p.height('caption')) // 2, INK if toggle else INK_DIM, align='right')
+                right = tx - 70
+            elif value:
+                fitted = p.fit_middle('caption', value, (w - 40) // 2)
+                p.text('caption', fitted, right, top + (h - p.height('caption')) // 2, INK_DIM, align='right')
+                right -= p.measure('caption', fitted)[0] + 24
+            p.text('button', text, x + 20, top + (h - p.height('button')) // 2, INK if focused else (210, 215, 221), max_width=right - x - 20)
+
+    def draw_hints(self, p, items):
+        x, y = MARGIN, 672
+        for key, label in items:
+            kw = p.measure('overline', key)[0] + 16
+            p.fill(x, y, kw, 24, SURFACE_HI, 230, 6)
+            p.text('overline', key, x + 8, y + (24 - p.height('overline')) // 2, INK)
+            x += kw + 8
+            x += p.text('caption', label, x, y + (24 - p.height('caption')) // 2, INK_DIM) + 24
+
+    def status_tone(self):
+        status = self.status.lower()
+        if "couldn't" in status or 'could not' in status or 'fail' in status:
+            return DANGER
+        if 'available' in status:
+            return ACCENT
+        if 'up to date' in status or 'ready' in status or 'game data:' in status:
+            return SUCCESS
+        return INK_FAINT
+
+    def tip_parts_at(self, now):
+        cached = getattr(self, '_tip_cache', None)
+        if cached is None or cached[0] != self.folder or now >= cached[1]:
+            cached = self._tip_cache = (self.folder, now + 1, play_tip_parts(self.folder))
+        return cached[2]
+
+    def draw_hero(self, p, dt):
+        p.scene()
+        x = MARGIN
+        if self.state in (State.READY, State.UPDATE_AVAILABLE):
+            now = time.monotonic()
+            static_tip = (getattr(self, 'snap', False) or self.reduce_motion
+                          or not getattr(self, 'tip_motion_supported', True))
+            tip_alpha, tip_dy = hint_motion.glow(now, reduced_motion=static_tip)
+            tip_y = 60 + tip_dy
+            draw_tip_line(p, self.tip_parts_at(now), x, tip_y, highlight_alpha=tip_alpha)
+            draw_tip_line(p, ('Hold ', 'Start + Back', ' for 2 seconds to open the game menu (XInput controllers).'),
+                          x, tip_y + 28, highlight_alpha=tip_alpha)
+        p.text('overline', 'STAR WARS', x + 2, 160, ACCENT)
+        p.text('display', 'Galactic Racer', x - 2, 176, INK, max_width=760)
+        if self.state == State.PLAYING:
+            subtitle = 'Have fun! The launcher waits here while you play.'
+        elif self.state in (State.READY, State.UPDATE_AVAILABLE):
+            subtitle = 'Installed and ready to play.'
+        else:
+            subtitle = 'Not installed yet.'
+        p.text('body', subtitle, x, 270, INK_DIM, max_width=620)
+        buttons = self.buttons()
+        cta = {'Play': 'PLAY', 'Download': 'DOWNLOAD', 'Update now': 'UPDATE NOW'}.get(buttons[0]) if buttons else None
+        top, w = 336, 340
+        if cta:
+            h = 68
+            self.hits.append((x, top, w, h, 0))
+            p.fill(x, top, w, h, ACCENT, 210 if getattr(self, 'hover', None) == 0 and self.focus != 0 else 255, 12)
+            if self.focus == 0:
+                p.ring(x - FOCUS_GAP, top - FOCUS_GAP, w + 2 * FOCUS_GAP, h + 2 * FOCUS_GAP, ACCENT, 220, 11 + FOCUS_GAP, 2)
+            p.text('cta', cta, x + w // 2, top + (h - p.height('cta')) // 2, ACCENT_INK, max_width=w - 40, align='center')
+            rows, first = buttons[1:], 1
+        else:
+            h = 68
+            p.fill(x, top, w, h, SURFACE_HI, 200, 12)
+            p.circle(x + 30, top + h // 2, 6, SUCCESS)
+            p.text('cta', 'NOW PLAYING', x + 50, top + (h - p.height('cta')) // 2, INK, max_width=w - 70)
+            if buttons and buttons[0] == 'Quit game':
+                rows, first = buttons[1:], 1
+            else:
+                rows, first = buttons, 0
+        self.draw_rows(p, rows, x, top + h + 22, w, 50, 10, dt, first)
+        p.circle(x + 5, 626 + p.height('caption') // 2, 4, self.status_tone())
+        p.text('caption', self.status, x + 18, 626, INK_DIM, max_width=700)
+        self.draw_hints(p, [('A / ENTER', 'Select'), ('START / F1', 'Settings')])
+        p.text('caption', 'sable-loop v' + APP_VERSION, CANVAS[0] - MARGIN, 674, INK_FAINT, align='right')
+
+    def draw_progress(self, p, dt):
+        p.scene(scrim=150)
+        x, bar_w = MARGIN, 780
+        info = self.progress_info or {}
+        tool = self.operation == 'tool'
+        game = self.operation in GAME_OPERATIONS
+        title = 'Updating sable-loop' if tool else ('Updating the game' if self.operation == 'update' else f'Installing {GAME_NAME}')
+        pct = self.game_progress_pct if game else info.get('pct')
+        if not game and pct is None and info.get('phase') != 'Verifying the download...':
+            match = re.search(r'(\d{1,3})%', self.progress)
+            pct = min(100, int(match.group(1))) if match else None
+        phase = (self.progress or 'Preparing') if game else (info.get('phase') or ('Preparing' if pct is None else 'Downloading'))
+        p.text('overline', phase.upper(), x + 2, 124, ACCENT, max_width=bar_w)
+        p.text('title', title, x, 142, INK, max_width=bar_w)
+        if game and pct == 0 and phase == 'Checking existing files':
+            p.text('body', 'Checking files already on this PC…', x, 250, INK_DIM, max_width=bar_w)
+        elif pct is not None:
+            p.text('figure', f'{pct}%', x - 2, 204, INK)
+        else:
+            body = 'Please wait — this usually takes under a minute.' if tool else (self.progress or 'Getting things ready…')
+            p.text('body', body, x, 250, INK_DIM, max_width=bar_w)
+        p.fill(x, 300, bar_w, 12, (255, 255, 255), 30, 6)
+        if pct is not None:
+            target = bar_w * max(0, min(100, pct)) / 100
+            fill = target if game and pct == 100 else self.ease('game_bar' if game else 'bar', target, dt, rate=.12)
+            if fill >= 12:
+                p.fill(x, 300, fill, 12, ACCENT, 255, 6)
+        else:
+            phase_t = (time.monotonic() * .6) % 1
+            seg = 180
+            start = -seg + phase_t * (bar_w + seg)
+            left, right = max(x, x + start), min(x + bar_w, x + start + seg)
+            if right - left >= 12:
+                p.fill(left, 300, right - left, 12, ACCENT, 255, 6)
+        done, total, speed = info.get('done'), info.get('total'), info.get('speed') or 0
+        if (game and info.get('game_detail') and pct != 100
+                and ('game_detail_until' not in info or time.monotonic() < info['game_detail_until'])):
+            p.text('body', info['game_detail'], x, 326, INK_DIM, max_width=bar_w)
+        if not game and total:
+            p.text('body', f'{fmt_bytes(done)} of {fmt_bytes(total)}', x, 326, INK)
+            right = (fmt_bytes(speed) + '/s') if speed else ''
+            if speed and total > done:
+                right += ('  ·  ' if right else '') + fmt_eta((total - done) / speed) + ' left'
+            if right:
+                p.text('body', right, x + bar_w, 326, INK_DIM, align='right')
+        if not game and (pct is not None or tool):
+            detail = self.progress if not tool else "The launcher restarts by itself when it's done."
+            p.text('caption', detail, x, 364, INK_FAINT, max_width=bar_w, middle=True)
+        buttons = self.buttons()
+        if buttons:
+            self.draw_rows(p, buttons, x, 420, 240, 50, 10, dt)
+            self.draw_hints(p, [('A / ENTER', 'Select'), ('B / ESC', 'Cancel')])
+        else:
+            self.draw_hints(p, [])
+
+    def draw_panel(self, p, dt):
+        p.scene(scrim=205)
+        x, w = MARGIN, 720
+        overline, title = {'settings': ('LAUNCHER', 'Settings'), 'folder': ('GAME FOLDER', 'Where should the game go?'),
+                           'error': ('ERROR', 'Something went wrong'), 'update': ('GAME DATA', 'Update the game?')}[self.screen]
+        p.text('overline', overline, x + 2, 76, DANGER if self.screen == 'error' else ACCENT)
+        p.text('title', title, x, 94, INK, max_width=w)
+        top = 172
+        buttons = self.buttons()
+        if self.screen == 'settings':
+            visible = 7
+            first = min(getattr(self, 'settings_first', 0), max(0, len(buttons) - visible))
+            first = max(0, min(first, self.focus))
+            first = max(first, self.focus - visible + 1)
+            self.settings_first = first
+            self.draw_rows(p, buttons[first:first + visible], x, top, w, 52, 8, dt, first=first)
+            p.text('caption', self.free_space_text(), x, 604, INK_FAINT, max_width=w)
+        elif self.screen == 'folder':
+            p.fill(x, top, w, 66, SURFACE_HI, 200, 10)
+            p.text('overline', 'INSTALL LOCATION', x + 20, top + 10, INK_DIM)
+            p.text('body', str(self.folder), x + 20, top + 30, INK, max_width=w - 40, middle=True)
+            p.text('caption', self.free_space_text(), x, top + 78, INK_FAINT, max_width=w)
+            self.draw_rows(p, buttons, x, top + 120, 420, 50, 10, dt)
+        elif self.screen == 'error':
+            lines = p.wrap('body', self.last_error or 'An unknown error occurred.', w - 24, 4)
+            p.fill(x, top, 4, len(lines) * 30 - 2, DANGER, 255, 2)
+            for i, line in enumerate(lines):
+                p.text('body', line, x + 20, top + i * 30, INK)
+            p.text('caption', 'Details are in the log.', x + 20, top + len(lines) * 30 + 6, INK_FAINT)
+            self.draw_rows(p, buttons, x, top + len(lines) * 30 + 50, 320, 50, 10, dt)
+        else:
+            p.text('body', 'Only changed files are downloaded. Your saves are not touched.', x, top, INK_DIM, max_width=w)
+            self.draw_rows(p, buttons, x, top + 56, 320, 50, 10, dt)
+        if self.screen in ('settings', 'folder') and self.status:
+            p.circle(x + 5, 630 + p.height('caption') // 2, 4, self.status_tone())
+            p.text('caption', self.status, x + 18, 630, INK_DIM, max_width=w - 18)
+        self.draw_hints(p, [('A / ENTER', 'Select'), ('B / ESC', 'Back')])
+
+    GFX_ACTION_HELP = {'Recommended for this PC': "DLSS (NVIDIA RTX) or FSR 3.1 Performance with frame generation and pacing, picked for this PC's graphics card.",
+                       'Reset to game defaults': "Every option back to the game's own default. Your controls and bindings stay.",
+                       'Back': 'Back to the launcher settings.'}
+
+    def gfx_layout(self):
+        """(kind, payload, top, height) for the scrolling list: group headings and option rows."""
+        rows, y, group = [], 0, None
+        for i, o in enumerate(self.gfx_options):
+            if o.group != group:
+                group = o.group
+                y += 12 if rows else 0
+                rows.append(('heading', group, y, 30))
+                y += 30
+            rows.append(('option', len(self.GFX_ACTIONS) + i, y, 44))
+            y += 50
+        return rows, y
+
+    def draw_graphics(self, p, dt):
+        p.scene(scrim=215)
+        x, w = MARGIN, CANVAS[0] - 2 * MARGIN
+        values, picker = self.gfx_values, self.gfx_picker
+        p.text('overline', 'SETTINGS · GAME', x + 2, 56, ACCENT)
+        p.text('title', 'Graphics', x, 74, INK, max_width=400)
+        p.text('caption', str(game_settings.ini_path(self.folder)), x + w, 96, INK_FAINT, max_width=560, align='right', middle=True)
+        # Action buttons along the top.
+        ax, ay, ah = x, 138, 44
+        for i, label in enumerate(self.GFX_ACTIONS):
+            aw = p.measure('button', label)[0] + 40
+            focused = picker is None and self.focus == i
+            hovered = picker is None and getattr(self, 'hover', None) == i
+            p.fill(ax, ay, aw, ah, SURFACE_FOCUS if focused or hovered else SURFACE_HI, 255 if focused else 220 if hovered else 200, 10)
+            if focused:
+                p.ring(ax - FOCUS_GAP, ay - FOCUS_GAP, aw + 2 * FOCUS_GAP, ah + 2 * FOCUS_GAP, ACCENT, 255, 10 + FOCUS_GAP, 2)
+            p.text('button', label, ax + 20, ay + (ah - p.height('button')) // 2, ACCENT if i == 0 else INK)
+            if picker is None:
+                self.hits.append((ax, ay, aw, ah, i))
+            ax += aw + 12
+        # The scrolling, grouped option list.
+        rows, total = self.gfx_layout()
+        view_top, view_h = 200, 384
+        target = getattr(self, 'gfx_scroll_target', 0)
+        if self.focus < len(self.GFX_ACTIONS):
+            target = 0
+        for kind, idx, top, h in rows:
+            if kind == 'option' and idx == self.focus:
+                target = min(target, top - 42)
+                target = max(target, top + h + 12 - view_h)
+        target = max(0, min(target, max(0, total - view_h)))
+        self.gfx_scroll_target = target
+        scroll = target
+        s = p.s
+        s.SDL_RenderSetClipRect(p.r, s.SDL_Rect(x - FOCUS_GAP - 2, view_top, w + 2 * FOCUS_GAP + 4, view_h))
+        focus_y = None
+        for kind, idx, top, h in rows:
+            y = view_top + top - scroll
+            if y + h < view_top or y > view_top + view_h:
+                continue
+            if kind == 'heading':
+                p.text('overline', idx.upper(), x + 2, y + 10, ACCENT)
+                continue
+            hovered = picker is None and getattr(self, 'hover', None) == idx
+            p.fill(x, y, w, h, SURFACE_FOCUS if hovered else SURFACE_HI, 220 if hovered else 150, 10)
+            if idx == self.focus and picker is None:
+                focus_y = y
+        if focus_y is not None:
+            fy = focus_y
+            p.fill(x, fy, w, 44, SURFACE_FOCUS, 255, 10)
+            p.ring(x - FOCUS_GAP, fy - FOCUS_GAP, w + 2 * FOCUS_GAP, 44 + 2 * FOCUS_GAP, ACCENT, 255, 10 + FOCUS_GAP, 2)
+        for kind, idx, top, h in rows:
+            y = view_top + top - scroll
+            if kind != 'option' or y + h < view_top or y > view_top + view_h:
+                continue
+            opt = self.gfx_option(idx)
+            value = values.get(opt.key, opt.default)
+            lock = game_settings.lock_reason(opt.key, values)
+            focused = idx == self.focus and picker is None
+            mid = y + (h - p.height('body')) // 2
+            right = x + w - 20
+            if focused:
+                right -= p.text('body', '›', right, mid, ACCENT, align='right') + 10
+            label = game_settings.display_value(opt, value, values, self.gfx_schema)
+            vw = p.text('body', label, right, mid, INK_FAINT if lock else (ACCENT if focused else INK), max_width=300, align='right')
+            right -= vw + 10
+            if focused:
+                right -= p.text('body', '‹', right, mid, ACCENT, align='right') + 14
+            if lock:
+                right -= p.text('caption', lock, right, y + (h - p.height('caption')) // 2, INK_FAINT, max_width=280, align='right') + 16
+            elif opt.restart:
+                right -= p.text('caption', 'after restart', right, y + (h - p.height('caption')) // 2, INK_FAINT, align='right') + 16
+            p.text('button', opt.label, x + 20, y + (h - p.height('button')) // 2, INK if focused else (210, 215, 221), max_width=right - x - 30)
+            if picker is None and y >= view_top and y + h <= view_top + view_h:
+                self.hits.append((x, y, w, h, idx))
+        s.SDL_RenderSetClipRect(p.r, None)
+        if total > view_h:
+            thumb = max(40, view_h * view_h // total)
+            ty = view_top + (view_h - thumb) * scroll / max(1, total - view_h)
+            p.fill(x + w + 14, view_top, 4, view_h, (255, 255, 255), 25, 2)
+            p.fill(x + w + 14, ty, 4, thumb, ACCENT, 200, 2)
+        # Help for the focused row, then the status line.
+        opt = self.gfx_schema[picker] if picker is not None else self.gfx_option()
+        help_text = opt.desc if opt else self.GFX_ACTION_HELP.get(self.GFX_ACTIONS[min(self.focus, len(self.GFX_ACTIONS) - 1)], '')
+        if opt and opt.key == 'frame_generation_by' and self.gfx_schema is game_settings.BY_KEY_043:
+            help_text = 'Use F1 or Insert in-game for NVIDIA DLSS FG; the game checks your GPU and driver.'
+        p.text('caption', help_text, x, 598, INK_DIM, max_width=w)
+        if self.status:
+            p.circle(x + 5, 628 + p.height('caption') // 2, 4, self.status_tone())
+            p.text('caption', self.status, x + 18, 628, INK_DIM, max_width=w - 18)
+        if picker is not None:
+            self.draw_gfx_picker(p, dt)
+            self.draw_hints(p, [('A / ENTER', 'Choose'), ('B / ESC', 'Cancel')])
+        else:
+            self.draw_hints(p, [('A / ENTER', 'Change'), ('← / →', 'Adjust'), ('B / ESC', 'Back')])
+
+    def draw_gfx_picker(self, p, dt):
+        opt = self.gfx_schema[self.gfx_picker]
+        labels = self.buttons()
+        visible = min(10, len(labels))
+        first = max(0, min(self.focus - visible // 2, len(labels) - visible))
+        p.fill(0, 0, *CANVAS, SURFACE, 170)
+        pw, rh, gap = 460, 40, 6
+        ph = 84 + visible * (rh + gap)
+        px, py = (CANVAS[0] - pw) // 2, max(40, (CANVAS[1] - ph) // 2 - 10)
+        p.fill(px, py, pw, ph, SURFACE, 250, 16)
+        p.ring(px, py, pw, ph, SURFACE_FOCUS, 255, 16, 2)
+        p.text('overline', 'CHOOSE A VALUE', px + 24, py + 18, ACCENT)
+        p.text('heading', opt.label, px + 24, py + 36, INK, max_width=pw - 48)
+        top = py + 72
+        self.draw_rows(p, labels[first:first + visible], px + 20, top, pw - 40, rh, gap, dt, first=first)
+        allowed = self.gfx_allowed(opt.key)
+        current = self.gfx_values.get(opt.key, opt.default)
+        if current in allowed[first:first + visible]:
+            i = allowed.index(current) - first
+            p.text('caption', 'Current', px + pw - 40, top + i * (rh + gap) + (rh - p.height('caption')) // 2, ACCENT, align='right')
+
+    def render(self, p, dt):
+        self.hits = []
+        if self.state == State.PLAYING and self.screen in ('main', 'settings', 'folder', 'error', 'update'):
+            self.quit_button = top_right(CANVAS[0], MARGIN)
+        else:
+            self.quit_button = None
+            self.quit_hover = False
+        count = len(self.buttons())
+        if count and self.focus >= count:
+            self.focus = count - 1
+        if self.screen == 'main': self.draw_hero(p, dt)
+        elif self.screen == 'progress': self.draw_progress(p, dt)
+        elif self.screen == 'graphics': self.draw_graphics(p, dt)
+        else: self.draw_panel(p, dt)
+        if self.quit_button is not None:
+            left, top, width, height = self.quit_button.rect
+            focused = self.screen == 'main' and self.focus == 0 and self.buttons()[:1] == ['Quit game']
+            hovered = getattr(self, 'quit_hover', False)
+            p.fill(left, top, width, height, SURFACE_FOCUS if focused or hovered else SURFACE_HI,
+                   255 if focused else 230, 10)
+            if focused:
+                p.ring(left - FOCUS_GAP, top - FOCUS_GAP, width + 2 * FOCUS_GAP, height + 2 * FOCUS_GAP,
+                       ACCENT, 255, 10 + FOCUS_GAP, 2)
+            label = 'Quit game'
+            p.text('caption', label, left + (width - p.measure('caption', label)[0]) // 2,
+                   top + (height - p.height('caption')) // 2, INK)
+
+    def screenshot_scenes(self):
+        """Realistic fake states for the --screenshot design/regression loop."""
+        long = Path('C:/Games/' + 'Very Long Game Folder Name/' * 8 + 'Ocarina of Time')
+        def scene(name, screen, state, status='', focus=0, **values):
+            def setup():
+                self.state, self.status = state, status
+                self.tool_update_available, self.operation = False, None
+                self.set_screen(screen)
+                for key, value in values.items(): setattr(self, key, value)
+                self.focus = focus
+            return name, setup
+        defaults = {o.key: o.default for o in game_settings.OPTIONS}
+        dlss_values = dict(defaults, **{k: int(v) for k, v in game_settings.PRESET_DLSS.items() if k in game_settings.BY_KEY})
+        fsr_values = dict(defaults, **{k: int(v) for k, v in game_settings.PRESET_FSR.items() if k in game_settings.BY_KEY}, hdr=1, output_res=2)
+        values_043 = {o.key: o.default for o in game_settings.OPTIONS_043}
+        values_043.update(dlss=1, frame_generation=2, hdr=2, hdr_tone_mapper=1)
+        focus_043 = len(self.GFX_ACTIONS) + next(i for i, o in enumerate(game_settings.OPTIONS_043)
+                                                if o.key == 'frame_generation_by')
+        return [
+            scene('main', 'main', State.READY, 'HeyListen is up to date.'),
+            scene('playing', 'main', State.PLAYING, 'Playing...'),
+            scene('hero-download', 'main', State.NOT_INSTALLED, 'Game data: 2026.11.16', folder=long),
+            scene('progress', 'progress', State.DOWNLOADING, operation='download', _game_progress_pct=63,
+                  progress='Downloading game files', progress_info={'game_detail': game_progress_detail(
+                      {'phase': 'Downloading', 'speed': 23218411, 'done': 19300000000, 'total': 30871262365})}),
+            scene('tool-update', 'progress', State.READY, operation='tool', progress_info={}, progress='Updating HeyListen…'),
+            scene('settings', 'settings', State.READY, 'HeyListen is up to date.', focus=2, folder=long),
+            scene('settings-back', 'settings', State.READY, 'HeyListen is up to date.', focus=7, folder=long),
+            scene('folder', 'folder', State.NOT_INSTALLED, '', focus=1, folder=long),
+            scene('update', 'update', State.UPDATE_AVAILABLE),
+            scene('error', 'error', State.ERROR, operation='download', last_error='Could not reach the update server. The connection stalled three times while downloading whole-07.bin from objects.githubusercontent.com; check your network and try again.'),
+            scene('graphics', 'graphics', State.READY, 'Frame generation: Auto · saved', focus=len(self.GFX_ACTIONS) + 1,
+                  gfx_values=dlss_values, gfx_picker=None, gfx_dlss_ok=True),
+            scene('graphics-fsr', 'graphics', State.READY, 'Recommended applied: FSR 3.1 Performance', focus=len(self.GFX_ACTIONS) + 16,
+                  gfx_values=fsr_values, gfx_picker=None, gfx_dlss_ok=False, folder=long),
+            scene('graphics-actions', 'graphics', State.READY, 'Saved to the game at once. In game: F1 or Insert opens its menu; its last row, Quit (A twice), exits the game.', focus=0,
+                  gfx_values=dlss_values, gfx_picker=None, gfx_dlss_ok=True),
+            scene('graphics-picker', 'graphics', State.READY, '', focus=1, gfx_values=dlss_values, gfx_picker='frame_generation',
+                  gfx_return=len(self.GFX_ACTIONS) + 5, gfx_dlss_ok=True),
+            scene('graphics-v043', 'graphics', State.READY, '', focus=focus_043, gfx_values=values_043,
+                  gfx_options=game_settings.OPTIONS_043, gfx_schema=game_settings.BY_KEY_043, gfx_picker=None),
+            scene('graphics-v043-hdr-picker', 'graphics', State.READY, '', focus=123, gfx_values=values_043,
+                  gfx_options=game_settings.OPTIONS_043, gfx_schema=game_settings.BY_KEY_043,
+                  gfx_picker='psychov35_ui_brightness'),
+        ]
+
+    def run(self, screenshot=None):
+        if _test_gui_install_enabled() and not screenshot:
+            log_message('Test GUI: entering SDL initialization')
+        if screenshot:
+            os.environ['SDL_VIDEODRIVER'] = 'dummy'
+        if getattr(sys, 'frozen', False): os.environ['PYSDL2_DLL_PATH'] = str(ROOT)
+        import sdl2 as s
+        import sdl2.sdlttf as ttf
+        enable_dpi_awareness()
+        s.SDL_SetHint(b'SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS', b'0')
+        s.SDL_SetHint(b'SDL_GAMECONTROLLER_USE_BUTTON_LABELS', b'1')
+        try:
+            s.SDL_SetHint(b'SDL_WINDOWS_DPI_AWARENESS', b'permonitorv2')
+            s.SDL_SetHint(b'SDL_WINDOWS_DPI_SCALING', b'1')
+        except Exception:
+            pass
+        if s.SDL_Init(s.SDL_INIT_VIDEO | s.SDL_INIT_GAMECONTROLLER) != 0: raise RuntimeError(s.SDL_GetError().decode())
+        if _test_gui_install_enabled() and not screenshot:
+            log_message('Test GUI: SDL initialized')
+        if ttf.TTF_Init() != 0: raise RuntimeError('SDL_ttf initialization failed')
+        if _test_gui_install_enabled() and not screenshot:
+            log_message('Test GUI: fonts initialized')
+        size = CANVAS
+        if screenshot and os.environ.get('HEYLISTEN_SCREENSHOT_SIZE'):
+            match = re.fullmatch(r'(\d{1,4})x(\d{1,4})', os.environ['HEYLISTEN_SCREENSHOT_SIZE'])
+            if not match or not all(1 <= int(n) <= 4096 for n in match.groups()):
+                raise ValueError('Invalid screenshot size')
+            size = tuple(map(int, match.groups()))
+        window = s.SDL_CreateWindow(GAME_NAME.encode('utf-8'), s.SDL_WINDOWPOS_CENTERED, s.SDL_WINDOWPOS_CENTERED, *size, s.SDL_WINDOW_RESIZABLE | s.SDL_WINDOW_ALLOW_HIGHDPI)
+        if not screenshot:
+            style_window_caption(window)
+        renderer = create_renderer(s, window, screenshot=bool(screenshot))
+        if not window or not renderer: raise RuntimeError('Could not create the launcher window')
+        renderer_info = s.SDL_RendererInfo()
+        flags = (renderer_info.flags
+                 if s.SDL_GetRendererInfo(renderer, ctypes.byref(renderer_info)) == 0 else 0)
+        self.tip_motion_supported = bool(flags & s.SDL_RENDERER_ACCELERATED)
+        s.SDL_RenderSetLogicalSize(renderer, 1280, 720)
+        s.SDL_SetRenderDrawColor(renderer, *SURFACE, 255)
+        s.SDL_RenderClear(renderer)
+        s.SDL_RenderPresent(renderer)
+        painter = Painter(s, ttf, renderer)
+        class SDLWindowControls:
+            def __init__(self, window): self.window = window
+            def minimize(self): s.SDL_MinimizeWindow(self.window)
+            def restore(self): s.SDL_RestoreWindow(self.window)
+            def raise_window(self): s.SDL_RaiseWindow(self.window)
+        window_controls = SDLWindowControls(window)
+        if _test_gui_install_enabled() and not screenshot:
+            log_message('Test GUI: SDL renderer initialized')
+        def close_pads():
+            for pad in self.controllers.values():
+                s.SDL_GameControllerClose(pad)
+            self.controllers.clear()
+        self.close_controllers = close_pads
+        def open_pads():
+            if self.state == State.PLAYING:
+                return
+            for i in range(s.SDL_NumJoysticks()):
+                if s.SDL_IsGameController(i):
+                    p = s.SDL_GameControllerOpen(i)
+                    if p:
+                        joystick = s.SDL_GameControllerGetJoystick(p)
+                        ident = s.SDL_JoystickInstanceID(joystick)
+                        if ident in self.controllers: s.SDL_GameControllerClose(p)
+                        else: self.controllers[ident] = p
+        self.open_controllers = open_pads
+        open_pads()
+        event = s.SDL_Event()
+        scenes = iter(self.screenshot_scenes()) if screenshot else None
+        scene_name = None
+        if screenshot:
+            self.snap = True
+            scene_name, setup = next(scenes)
+            setup()
+        self.hits = []
+        last = time.monotonic()
+        test_install = _test_gui_install_enabled() and not screenshot
+        last_test_progress = None
+        if test_install:
+            log_message('Test GUI: starting fixture installation')
+            self.start_operation()
+            last_test_progress = (self.state, self.game_progress_pct)
+            log_message(f'Test GUI progress: state={last_test_progress[0]} pct={last_test_progress[1]}')
+        try:
+            while self.running:
+                was_playing = self.state == State.PLAYING
+                self.drain()
+                if not screenshot and self._watch_should_poll():
+                    watch = self._game_watch()
+                    if watch is not None:
+                        try: watch.poll()
+                        except Exception as exc: log_message(f'Game watch: {exc}')
+                while self._window_requests:
+                    state_request = self._window_requests.pop(0)
+                    if not screenshot:
+                        self._window_control.apply(state_request, window_controls)
+                if test_install and (self.operation in GAME_OPERATIONS or self.state in (State.DOWNLOADING, State.UPDATING)):
+                    test_progress = (self.state, self.game_progress_pct)
+                    if test_progress != last_test_progress:
+                        log_message(f'Test GUI progress: state={test_progress[0]} pct={test_progress[1]}')
+                        last_test_progress = test_progress
+                registration = getattr(self, 'install_registration', None)
+                if test_install and self.operation is None and (registration is None or not registration.is_alive()):
+                    log_message(f'Test GUI: installation finished, state={self.state}, error={self.last_error}')
+                    self.running = False
+                if was_playing and self.state != State.PLAYING:
+                    open_pads()
+                now = time.monotonic()
+                for action in self.mapper.tick(now): self.action(action)
+                while s.SDL_PollEvent(ctypes.byref(event)):
+                    typ = event.type
+                    if typ == s.SDL_QUIT:
+                        if not (self.screen == 'progress' and self.operation == 'tool'): self.running = False
+                    elif typ == s.SDL_WINDOWEVENT:
+                        if event.window.event == s.SDL_WINDOWEVENT_MINIMIZED:
+                            self._window_control.observe('minimized')
+                        elif event.window.event in (s.SDL_WINDOWEVENT_RESTORED, s.SDL_WINDOWEVENT_MAXIMIZED):
+                            self._on_window_restored()
+                    elif typ == s.SDL_CONTROLLERDEVICEADDED: open_pads()
+                    elif typ == s.SDL_CONTROLLERDEVICEREMOVED:
+                        pad = self.controllers.pop(event.cdevice.which, None)
+                        if pad: s.SDL_GameControllerClose(pad)
+                    elif typ in (s.SDL_CONTROLLERBUTTONDOWN, s.SDL_CONTROLLERBUTTONUP):
+                        if not (s.SDL_GetWindowFlags(window) & s.SDL_WINDOW_INPUT_FOCUS):
+                            continue
+                        button = {s.SDL_CONTROLLER_BUTTON_A:'a', s.SDL_CONTROLLER_BUTTON_B:'b', s.SDL_CONTROLLER_BUTTON_START:'start', s.SDL_CONTROLLER_BUTTON_X:'x'}.get(event.cbutton.button)
+                        direction = {s.SDL_CONTROLLER_BUTTON_DPAD_UP:'up', s.SDL_CONTROLLER_BUTTON_DPAD_DOWN:'down', s.SDL_CONTROLLER_BUTTON_DPAD_LEFT:'left', s.SDL_CONTROLLER_BUTTON_DPAD_RIGHT:'right'}.get(event.cbutton.button)
+                        if direction and typ == s.SDL_CONTROLLERBUTTONDOWN: self.action(direction)
+                        if button:
+                            for action in self.mapper.feed({'type':'button','button':button,'down':typ == s.SDL_CONTROLLERBUTTONDOWN}, now): self.action(action)
+                    elif typ == s.SDL_CONTROLLERAXISMOTION and event.caxis.axis in (0, 1):
+                        if not (s.SDL_GetWindowFlags(window) & s.SDL_WINDOW_INPUT_FOCUS):
+                            continue
+                        self.axis[event.caxis.axis] = max(-1, event.caxis.value / 32767)
+                        for action in self.mapper.feed({'type':'axis','x':self.axis[0],'y':self.axis[1]}, now): self.action(action)
+                    elif typ == s.SDL_KEYDOWN and not event.key.repeat:
+                        action = {s.SDLK_UP:'up',s.SDLK_w:'up',s.SDLK_DOWN:'down',s.SDLK_s:'down',s.SDLK_LEFT:'left',s.SDLK_a:'left',s.SDLK_RIGHT:'right',s.SDLK_d:'right',s.SDLK_RETURN:'accept',s.SDLK_SPACE:'accept',s.SDLK_ESCAPE:'back',s.SDLK_BACKSPACE:'back',s.SDLK_F1:'menu',s.SDLK_TAB:'menu'}.get(event.key.keysym.sym)
+                        if action: self.action(action)
+                    elif typ == s.SDL_MOUSEWHEEL and self.screen in ('graphics', 'settings'):
+                        for _ in range(min(5, abs(event.wheel.y))): self.action('up' if event.wheel.y > 0 else 'down')
+                    elif typ in (s.SDL_MOUSEMOTION, s.SDL_MOUSEBUTTONUP):
+                        mx = event.motion.x if typ == s.SDL_MOUSEMOTION else event.button.x
+                        my = event.motion.y if typ == s.SDL_MOUSEMOTION else event.button.y
+                        # SDL supplies logical coordinates; hover never replaces focus.
+                        self.pointer(mx, my, typ == s.SDL_MOUSEBUTTONUP and event.button.button == s.SDL_BUTTON_LEFT)
+                frame_now = time.monotonic()
+                dt, last = min(.1, frame_now - last), frame_now
+                output_w, output_h = ctypes.c_int(), ctypes.c_int()
+                if s.SDL_GetRendererOutputSize(renderer, ctypes.byref(output_w), ctypes.byref(output_h)) == 0:
+                    painter.set_density(render_density(output_w.value, output_h.value))
+                self.render(painter, dt)
+                if screenshot:
+                    surface = s.SDL_CreateRGBSurfaceWithFormat(0, size[0], size[1], 32, s.SDL_PIXELFORMAT_ARGB8888)
+                    s.SDL_RenderSetLogicalSize(renderer, 0, 0)
+                    if not surface or s.SDL_RenderReadPixels(renderer, None, s.SDL_PIXELFORMAT_ARGB8888, surface.contents.pixels, surface.contents.pitch) != 0:
+                        raise RuntimeError('Could not capture launcher frame')
+                    path = Path(screenshot)
+                    output = path.with_name(path.stem + '-' + scene_name + '.bmp')
+                    if s.SDL_SaveBMP(surface, str(output).encode()) != 0:
+                        raise RuntimeError('Could not save launcher frame')
+                    s.SDL_FreeSurface(surface)
+                    s.SDL_RenderSetLogicalSize(renderer, *CANVAS)
+                    nxt = next(scenes, None)
+                    if nxt is None:
+                        self.operation = None
+                        break
+                    scene_name, setup = nxt
+                    setup()
+                    continue
+                present_frame(s, renderer, flags)
+        finally:
+            if self.screen == 'progress' and self.operation != 'tool': terminate_worker(self.events)
+            for pad in self.controllers.values(): s.SDL_GameControllerClose(pad)
+            painter.close(); s.SDL_DestroyRenderer(renderer); s.SDL_DestroyWindow(window); ttf.TTF_Quit(); s.SDL_Quit()
+
+
+def show_startup_error(exc):
+    log_message(f'Startup error: {exc}')
+    try:
+        ui = LauncherUI(startup_error=exc)
+        ui.last_error = str(exc)
+        ui.operation = 'startup'
+        ui.set_screen('error')
+        ui.run()
+    except Exception as screen_error:
+        log_message(f'Unable to display error screen: {screen_error}')
+    return 1
+
+
+def main():
+    if '--cli' in sys.argv:
+        args = sys.argv[1:]; args.remove('--cli')
+        return subprocess.call(cli_command(*args))
+    if '--self-test' in sys.argv:
+        app = App(State.NOT_INSTALLED); app.transition(State.DOWNLOADING); app.transition(State.READY)
+        return 0
+    try:
+        if '--screenshot' in sys.argv:
+            index = sys.argv.index('--screenshot')
+            if index + 1 >= len(sys.argv):
+                raise ValueError('--screenshot requires an output path')
+            original_check = LauncherUI.check_updates
+            try:
+                LauncherUI.check_updates = lambda self: None
+                LauncherUI().run(screenshot=sys.argv[index + 1])
+            finally:
+                LauncherUI.check_updates = original_check
+        else:
+            LauncherUI().run()
+        return 0
+    except Exception as exc:
+        return show_startup_error(exc)
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
