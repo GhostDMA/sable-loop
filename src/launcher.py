@@ -22,9 +22,7 @@ try:
     import winreg
 except ImportError:
     winreg = None
-import game_settings
 import game_state
-import hint_motion
 from quit_control import top_right
 from window_state import WindowController
 from update_resources import resolve_update_script
@@ -63,6 +61,7 @@ def _test_gui_install_enabled():
     return _TEST_GUI_INSTALL and _TEST_VIDEO_DRIVER == 'dummy' and bool(_TEST_GAME_MANIFEST)
 
 GAME_NAME = 'Star Wars: Galactic Racer'
+GAME_FOLDER_NAME = 'STAR WARS Galactic Racer'
 MANIFEST_URL = 'https://github.com/GhostDMA/sable-loop/releases/download/v1.0.0/game-manifest.json'
 
 
@@ -77,132 +76,6 @@ def game_manifest_url():
 
 
 APP_VERSION = '1.0.0'
-
-
-def play_tip_parts(folder):
-    try:
-        shortcut = game_settings.read_values(folder)['menu_shortcut']
-        keys = {0: 'F1 or Insert', 1: 'Insert', 2: 'F1'}.get(shortcut)
-    except OSError:
-        keys = None
-    if keys:
-        return 'While playing, press ', keys, ' for settings or to quit.'
-    return 'While playing, open the game menu for settings or to quit.', '', ''
-
-
-def play_tip(folder):
-    return ''.join(play_tip_parts(folder))
-
-
-class MenuCombo:
-    def __init__(self):
-        self.started = None
-        self.fired = False
-
-    def update(self, start, back, now):
-        if not (start and back):
-            self.started, self.fired = None, False
-        elif self.started is None:
-            self.started = now
-        elif not self.fired and now - self.started >= 2:
-            self.fired = True
-            return True
-        return False
-
-
-def menu_combo_key(folder):
-    return 0x70 if game_settings.read_values(folder).get('menu_shortcut', 0) == 2 else 0x2d
-
-
-def game_is_foreground(pid):
-    user32 = ctypes.windll.user32
-    user32.GetForegroundWindow.restype = ctypes.c_void_p
-    hwnd = user32.GetForegroundWindow()
-    owner = ctypes.c_ulong()
-    if hwnd:
-        user32.GetWindowThreadProcessId(ctypes.c_void_p(hwnd), ctypes.byref(owner))
-    return bool(hwnd and owner.value == pid)
-
-
-def send_menu_key(pid, key):
-    from ctypes import wintypes
-    class KEYBDINPUT(ctypes.Structure):
-        _fields_ = [('wVk', wintypes.WORD), ('wScan', wintypes.WORD), ('dwFlags', wintypes.DWORD), ('time', wintypes.DWORD), ('dwExtraInfo', ctypes.c_size_t)]
-    class MOUSEINPUT(ctypes.Structure):
-        _fields_ = [('dx', wintypes.LONG), ('dy', wintypes.LONG), ('mouseData', wintypes.DWORD), ('dwFlags', wintypes.DWORD), ('time', wintypes.DWORD), ('dwExtraInfo', ctypes.c_size_t)]
-    class HARDWAREINPUT(ctypes.Structure):
-        _fields_ = [('uMsg', wintypes.DWORD), ('wParamL', wintypes.WORD), ('wParamH', wintypes.WORD)]
-    class INPUT_UNION(ctypes.Union):
-        _fields_ = [('ki', KEYBDINPUT), ('mi', MOUSEINPUT), ('hi', HARDWAREINPUT)]
-    class INPUT(ctypes.Structure):
-        _fields_ = [('type', wintypes.DWORD), ('data', INPUT_UNION)]
-    if not game_is_foreground(pid):
-        return
-    inputs = (INPUT * 2)(INPUT(1, INPUT_UNION(ki=KEYBDINPUT(key, 0, 0, 0, 0))), INPUT(1, INPUT_UNION(ki=KEYBDINPUT(key, 0, 2, 0, 0))))
-    if ctypes.windll.user32.SendInput(2, inputs, ctypes.sizeof(INPUT)) != 2:
-        raise OSError('SendInput failed')
-
-
-class ComboWatcher:
-    def __init__(self, process, folder):
-        self.process, self.folder, self.holds = process, folder, {}
-
-    def tick(self, buttons, now):
-        try:
-            if self.process.poll() is not None:
-                return False
-            if not game_is_foreground(self.process.pid):
-                self.holds.clear()
-                return True
-            self.holds = {ident: self.holds.get(ident, MenuCombo()) for ident in buttons}
-            for ident, (start, back) in buttons.items():
-                if self.holds[ident].update(start, back, now):
-                    send_menu_key(self.process.pid, menu_combo_key(self.folder))
-            return True
-        except Exception as exc:
-            log_message(f'Controller menu watcher: {exc}')
-            return False
-
-
-class XInputGamepad(ctypes.Structure):
-    _fields_ = [('wButtons', ctypes.c_ushort), ('bLeftTrigger', ctypes.c_ubyte), ('bRightTrigger', ctypes.c_ubyte), ('sThumbLX', ctypes.c_short), ('sThumbLY', ctypes.c_short), ('sThumbRX', ctypes.c_short), ('sThumbRY', ctypes.c_short)]
-
-
-class XInputState(ctypes.Structure):
-    _fields_ = [('dwPacketNumber', ctypes.c_uint32), ('Gamepad', XInputGamepad)]
-
-
-def load_xinput():
-    for dll in ('xinput1_4', 'xinput1_3', 'xinput9_1_0'):
-        try:
-            get_state = ctypes.WinDLL(dll).XInputGetState
-            get_state.argtypes = (ctypes.c_uint32, ctypes.POINTER(XInputState))
-            get_state.restype = ctypes.c_uint32
-            return get_state
-        except (OSError, AttributeError):
-            continue
-    raise OSError('XInput unavailable')
-
-
-def watch_controller_combo(process, folder):
-    try:
-        get_state = load_xinput()
-        watcher = ComboWatcher(process, folder)
-        while process.poll() is None:
-            buttons = {}
-            for index in range(4):
-                state = XInputState()
-                result = get_state(index, ctypes.byref(state))
-                if result == 0:
-                    value = state.Gamepad.wButtons
-                    buttons[index] = (bool(value & 0x10), bool(value & 0x20))
-                elif result != 1167:
-                    raise OSError(f'XInputGetState failed: {result}')
-            if not watcher.tick(buttons, time.monotonic()):
-                break
-            time.sleep(0.05)
-    except Exception as exc:
-        log_message(f'Controller menu watcher: {exc}')
 
 
 def windows_animations_enabled():
@@ -284,24 +157,10 @@ def create_renderer(s, window, screenshot=False):
     return renderer or s.SDL_CreateRenderer(window, -1, s.SDL_RENDERER_SOFTWARE)
 
 
-def tip_offset(t, snap=False):
-    return 0 if snap else hint_motion.glow(t, reduced_motion=False)[1]
-
-
 def present_frame(s, renderer, flags):
     s.SDL_RenderPresent(renderer)
     if not (flags & s.SDL_RENDERER_ACCELERATED and flags & s.SDL_RENDERER_PRESENTVSYNC):
         s.SDL_Delay(16)
-
-
-def draw_tip_line(p, parts, x, y, highlight_alpha=255):
-    for index, (part, color) in enumerate(zip(parts, (INK_DIM, INK, INK_DIM))):
-        if part:
-            if index == 1:
-                p.text('body', part, x, y, color, alpha=highlight_alpha, subpixel=True)
-            else:
-                p.text('body', part, x, y, color, subpixel=True)
-            x += p.measure('body', part)[0]
 
 
 def cli_command(*args):
@@ -680,8 +539,8 @@ def load_game_folder():
 def game_folder_candidates():
     profile = Path(os.environ.get('USERPROFILE', str(Path.home())))
     legacy = profile / 'Games' / 'sable-loop-game'
-    primary = Path(r'C:\Games') / 'sable-loop-game'
-    fallback = profile / 'Games' / 'sable-loop-game'
+    primary = Path(r'C:\Games') / GAME_FOLDER_NAME
+    fallback = profile / 'Games' / GAME_FOLDER_NAME
     return primary, fallback, legacy
 
 
@@ -751,11 +610,9 @@ def resolve_game_folder():
     primary, fallback, legacy = game_folder_candidates()
     # First run (no configured destination): resume an existing partial or full
     # install instead of silently downloading a second copy into a fresh folder.
-    adopted = adopt_existing((legacy, primary, fallback))
+    adopted = adopt_existing((primary, fallback, legacy))
     if adopted:
         return adopted
-    if legacy.exists():
-        return legacy
     try:
         probe_writable(primary)
         return primary
@@ -924,7 +781,7 @@ def schedule_owned_cleanup():
 
 def confirm_uninstall(message, gui=False):
     if gui and os.name == 'nt':
-        return ctypes.windll.user32.MessageBoxW(None, message, 'Uninstall sable-loop', 0x24) == 6
+        return ctypes.windll.user32.MessageBoxW(None, message, f'Uninstall {GAME_NAME}', 0x24) == 6
     log_message(message)
     return input('Continue? [y/N] ').strip().lower() == 'y'
 
@@ -949,7 +806,7 @@ def uninstall(keep_saves=True, purge_saves=False, gui=False):
         except TimeoutError:
             message = 'An installation or update is in progress. Please wait for it to finish, then retry uninstall.'
             if gui and os.name == 'nt':
-                ctypes.windll.user32.MessageBoxW(None, message, 'Uninstall sable-loop', 0x30)
+                ctypes.windll.user32.MessageBoxW(None, message, f'Uninstall {GAME_NAME}', 0x30)
             log_message(message)
             return False
         try:
@@ -1430,9 +1287,10 @@ class App:
         self.state = state
 
 # ---------------------------------------------------------------- look
-# One logical canvas, a dark palette with a single warm accent, and a fixed type scale.
+# One logical canvas, a dark palette with a blue accent, and a fixed type scale.
 CANVAS = (1280, 720)
-ACCENT = (232, 192, 112)
+ACCENT = (88, 183, 255)
+ACCENT_HOVER = (61, 143, 217)
 ACCENT_INK = (24, 18, 8)
 INK = (238, 240, 243)
 INK_DIM = (168, 176, 184)
@@ -1472,9 +1330,11 @@ class Painter:
         self.fonts, self.cache, self.backdrop = {}, {}, None
         self.density = 0
         self.set_density(1)
-        art = ROOT / 'assets' / 'ui-backdrop.bmp'
+        art_root = ROOT if getattr(sys, 'frozen', False) else ROOT.parent
+        art = art_root / 'assets' / 'keyart-bg.png'
         if art.is_file():
-            surface = s.SDL_LoadBMP(str(art).encode())
+            from sdl2.sdlimage import IMG_Load
+            surface = IMG_Load(str(art).encode())
             if surface:
                 self.backdrop = s.SDL_CreateTextureFromSurface(renderer, surface)
                 s.SDL_FreeSurface(surface)
@@ -1754,10 +1614,7 @@ class Painter:
 
 class LauncherUI:
     def __init__(self, startup_error=None):
-        self.profile = Path(os.environ.get('USERPROFILE', str(Path.home())))
-        self.primary = Path(r'C:\Games') / 'sable-loop-game'
-        self.fallback = self.profile / 'Games' / 'sable-loop-game'
-        self.legacy = self.fallback
+        self.primary, self.fallback, self.legacy = game_folder_candidates()
         try:
             self.config = json.loads(CONFIG.read_text(encoding='utf-8-sig'))
         except (OSError, ValueError):
@@ -1793,8 +1650,6 @@ class LauncherUI:
         self._target_cache = None
         self.quit_button = None
         self.quit_hover = False
-        self.gfx_values, self.gfx_picker, self.gfx_return, self.gfx_dlss_ok = {}, None, 0, True
-        self.gfx_options, self.gfx_schema = game_settings.OPTIONS, game_settings.BY_KEY
         if self.state == State.READY and getattr(sys, 'frozen', False) and '--screenshot' not in sys.argv:
             threading.Thread(target=self.shortcut_worker, daemon=True).start()
         if startup_error is None:
@@ -1868,13 +1723,7 @@ class LauncherUI:
         if self.screen == 'folder':
             return (['Update now'] if self.tool_update_available else []) + (['Use existing folder'] if legacy_exists(self.legacy) else []) + ['Use default folder', 'Choose another folder', 'Continue']
         if self.screen == 'settings':
-            return ['Change game folder', 'Speed up installs (one Windows permission, instant)', 'Graphics', 'Desktop shortcut: ' + ('On' if self.config.get('shortcut', True) else 'Off'), 'Check for updates automatically: ' + ('On' if self.config.get('auto_tool_update', True) else 'Off'), 'Check for updates now', 'View log', 'Back']
-        if self.screen == 'graphics':
-            if self.gfx_picker is not None:
-                opt = self.gfx_schema[self.gfx_picker]
-                return [game_settings.display_value(opt, v, self.gfx_values, self.gfx_schema)
-                        for v in self.gfx_allowed(opt.key)]
-            return list(self.GFX_ACTIONS) + [o.label for o in self.gfx_options]
+            return ['Change game folder', 'Speed up installs (one Windows permission, instant)', 'Desktop shortcut: ' + ('On' if self.config.get('shortcut', True) else 'Off'), 'Check for updates automatically: ' + ('On' if self.config.get('auto_tool_update', True) else 'Off'), 'Check for updates now', 'View log', 'Back']
         if self.screen == 'progress':
             return [] if self.operation == 'tool' or self.game_completion_until is not None else ['Cancel']
         if self.screen == 'error':
@@ -1892,115 +1741,11 @@ class LauncherUI:
         self.hover = None
         self.settings_first = 0
 
-    # ---------------------------------------------------------------- graphics
-    GFX_ACTIONS = ('Recommended for this PC', 'Reset to game defaults', 'Back')
-    GFX_PICKER_MIN = 7  # options with more values than this open a value list on A
-
-    def enter_graphics(self):
-        try:
-            self.gfx_values = game_settings.read_values(self.folder)
-        except OSError as exc:
-            self.last_error = f'Could not read the game settings: {exc}'
-            self.set_screen('error')
-            return
-        self.gfx_dlss_ok = game_settings.dlss_available(self.folder)
-        self.gfx_options = game_settings.options_for(self.folder)
-        self.gfx_schema = game_settings.BY_KEY_043 if self.gfx_options is game_settings.OPTIONS_043 else game_settings.BY_KEY
-        self.gfx_picker = None
-        self.set_screen('graphics')
-        self.focus = len(self.GFX_ACTIONS)
-        self.status = 'Saved to the game at once. In game: F1 or Insert opens its menu; its last row, Quit (A twice), exits the game.'
-
-    def leave_graphics(self):
-        self.gfx_picker = None
-        self.set_screen('settings')
-        self.focus = 2
-
-    def gfx_option(self, index=None):
-        index = self.focus if index is None else index
-        index -= len(self.GFX_ACTIONS)
-        return self.gfx_options[index] if 0 <= index < len(self.gfx_options) else None
-
-    def gfx_allowed(self, key):
-        return game_settings.allowed(key, self.gfx_dlss_ok, schema=self.gfx_schema, current=self.gfx_values)
-
-    def gfx_write(self, key, value):
-        try:
-            self.gfx_values = game_settings.set_value(self.folder, key, value, self.gfx_values)
-            opt = self.gfx_schema[key]
-            self.status = f'{opt.label}: {opt.text(self.gfx_values[key])}' + (' · applies after a restart' if opt.restart else ' · saved')
-        except OSError as exc:
-            self.status = f"Couldn't save: {exc}"
-
-    def gfx_step(self, direction):
-        opt = self.gfx_option()
-        if opt:
-            self.gfx_write(opt.key, game_settings.cycle(opt.key, self.gfx_values.get(opt.key, opt.default), direction,
-                                                       self.gfx_dlss_ok, schema=self.gfx_schema, current=self.gfx_values))
-
-    def gfx_apply_recommended(self):
-        def work():
-            try:
-                preset, why = game_settings.choose_preset(self.folder)
-                game_settings.write_values(self.folder, preset)
-                self.events.publish('graphics', ('Recommended applied: ' + why.split('-> ')[-1], game_settings.read_values(self.folder)))
-            except Exception as exc:
-                self.events.publish('graphics', (f"Couldn't apply the recommended settings: {exc}", None))
-        self.status = 'Detecting your graphics card…'
-        threading.Thread(target=work, daemon=True).start()
-
-    def gfx_activate(self):
-        buttons = self.buttons()
-        if not buttons:
-            return
-        if self.gfx_picker is not None:
-            values = self.gfx_allowed(self.gfx_picker)
-            self.gfx_write(self.gfx_picker, values[min(self.focus, len(values) - 1)])
-            self.gfx_picker, self.focus = None, self.gfx_return
-            return
-        choice = buttons[self.focus]
-        if choice == 'Back':
-            self.leave_graphics()
-        elif choice == 'Reset to game defaults':
-            try:
-                self.gfx_values = game_settings.reset_defaults(self.folder)
-                self.status = "Game defaults restored (your controls and bindings are kept)."
-            except OSError as exc:
-                self.status = f"Couldn't save: {exc}"
-        elif choice == 'Recommended for this PC':
-            self.gfx_apply_recommended()
-        else:
-            opt = self.gfx_option()
-            values = self.gfx_allowed(opt.key)
-            if len(values) > self.GFX_PICKER_MIN:
-                current = self.gfx_values.get(opt.key, opt.default)
-                self.gfx_picker, self.gfx_return = opt.key, self.focus
-                self.focus = values.index(current) if current in values else 0
-            else:
-                self.gfx_step(1)
-
-    def gfx_action(self, action):
-        """Graphics-only input; returns True when handled."""
-        if action in ('left', 'right'):
-            if self.gfx_picker is None:
-                if self.gfx_option():
-                    self.gfx_step(1 if action == 'right' else -1)
-                else:
-                    self.focus = max(0, min(len(self.GFX_ACTIONS) - 1, self.focus + (1 if action == 'right' else -1)))
-            return True
-        if action in ('back', 'cancel', 'menu'):
-            if self.gfx_picker is not None:
-                self.gfx_picker, self.focus = None, self.gfx_return
-            else:
-                self.leave_graphics()
-            return True
-        return False
-
     def start_tool_update(self):
         if self.operation == 'tool' and self.screen == 'progress':
             return
         self.operation = 'tool'
-        self.progress = 'Updating sable-loop…'
+        self.progress = 'Updating the launcher…'
         self.set_screen('progress')
         args = [arg for arg in sys.argv[1:] if arg not in ('--self-update', '--no-self-update')]
         if not args:
@@ -2027,8 +1772,6 @@ class LauncherUI:
         self.events = ProgressEvents()
         # Channel updates reconcile the destination manifest, not the legacy builder.
         args = ['--no-self-update', '--install-game', str(self.folder)]
-        if update:
-            args.append('--no-preset')
         if _TEST_GAME_MANIFEST and not update:
             args += ['--game-manifest', _TEST_GAME_MANIFEST]
         self.set_screen('progress')
@@ -2143,8 +1886,6 @@ class LauncherUI:
             log_message(f'Quit game: {exc}')
 
     def activate(self):
-        if self.screen == 'graphics':
-            return self.gfx_activate()
         buttons = self.buttons()
         if not buttons:
             return
@@ -2160,10 +1901,6 @@ class LauncherUI:
                 self._own_game_process = process
                 self._own_game_exe = str(target)
                 self._request_window('minimized')
-                try:
-                    threading.Thread(target=watch_controller_combo, args=(process, self.folder), daemon=True).start()
-                except Exception as exc:
-                    log_message(f'Controller menu watcher: {exc}')
                 self.state = State.PLAYING
                 self.status = 'Playing...'
                 self.focus = 0
@@ -2217,7 +1954,6 @@ class LauncherUI:
             except Exception:
                 self.status = 'Unavailable'
         elif choice == 'Change game folder': self.set_screen('folder')
-        elif choice == 'Graphics': self.enter_graphics()
         elif choice.startswith('Desktop shortcut'):
             enabled = not self.config.get('shortcut', True)
             try:
@@ -2293,8 +2029,6 @@ class LauncherUI:
 
     def action(self, action):
         if self.screen == 'progress' and (self.operation == 'tool' or self.game_completion_until is not None):
-            return
-        if self.screen == 'graphics' and self.gfx_action(action):
             return
         if action == 'up': self.focus = max(0, self.focus - 1)
         elif action == 'down': self.focus = min(len(self.buttons()) - 1, self.focus + 1)
@@ -2397,7 +2131,7 @@ class LauncherUI:
                 match = re.fullmatch(r'v(\d+)\.(\d+)\.(\d+)', value)
                 if match and tuple(map(int, match.groups())) > tuple(map(int, APP_VERSION.split('.'))):
                     self.tool_update_available = True
-                    self.status = 'sable-loop update available: ' + value
+                    self.status = f'{GAME_NAME} launcher update available: {value}'
                     if self.operation in ('game', 'download', 'update'):
                         try:
                             STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -2410,20 +2144,15 @@ class LauncherUI:
                         self.start_tool_update()
                 elif match:
                     self.tool_update_available = False
-                    self.status = 'sable-loop is up to date.'
+                    self.status = f'{GAME_NAME} is up to date.'
             elif kind == 'tool_complete':
                 # The child must exit first; its helper then waits for this GUI to exit before swapping.
                 self.running = False
             elif kind == 'tool_current':
                 self.tool_update_available = False
                 self.operation = None
-                self.status = 'sable-loop is up to date.'
+                self.status = f'{GAME_NAME} is up to date.'
                 self.set_screen('main')
-            elif kind == 'graphics':
-                message, values = value
-                self.status = message
-                if values:
-                    self.gfx_values = values
             elif kind == 'upstream_check' and value == 10:
                 self.status = 'An upstream builder update is available.'
         if self.game_completion_until is not None and time.monotonic() >= self.game_completion_until:
@@ -2509,7 +2238,7 @@ class LauncherUI:
     def draw_primary(self, p, label, index, x, y, w, h, role='button'):
         self.hits.append((x, y, w, h, index))
         hovered = getattr(self, 'hover', None) == index
-        p.fill(x, y, w, h, ACCENT, 220 if hovered and self.focus != index else 255, 12)
+        p.fill(x, y, w, h, ACCENT_HOVER if hovered else ACCENT, 255, 12)
         if self.focus == index:
             p.ring(x - FOCUS_GAP, y - FOCUS_GAP, w + 2 * FOCUS_GAP, h + 2 * FOCUS_GAP, ACCENT, 225, 12 + FOCUS_GAP, 2)
         p.text(role, label, x + w // 2, y + (h - p.height(role)) // 2, ACCENT_INK, max_width=w - 32, align='center')
@@ -2519,7 +2248,7 @@ class LauncherUI:
         for key, label in items:
             kw = p.measure('overline', key)[0] + 16
             p.fill(x, y, kw, 24, SURFACE_HI, 230, 6)
-            p.text('overline', key, x + 8, y + (24 - p.height('overline')) // 2, INK)
+            p.text('overline', key, x + 8, y + (24 - p.height('overline')) // 2, ACCENT)
             x += kw + 8
             x += p.text('caption', label, x, y + (24 - p.height('caption')) // 2, INK_DIM) + 24
 
@@ -2533,24 +2262,9 @@ class LauncherUI:
             return SUCCESS
         return INK_FAINT
 
-    def tip_parts_at(self, now):
-        cached = getattr(self, '_tip_cache', None)
-        if cached is None or cached[0] != self.folder or now >= cached[1]:
-            cached = self._tip_cache = (self.folder, now + 1, play_tip_parts(self.folder))
-        return cached[2]
-
     def draw_hero(self, p, dt):
         p.scene()
         x = MARGIN
-        if self.state in (State.READY, State.UPDATE_AVAILABLE):
-            now = time.monotonic()
-            static_tip = (getattr(self, 'snap', False) or self.reduce_motion
-                          or not getattr(self, 'tip_motion_supported', True))
-            tip_alpha, tip_dy = hint_motion.glow(now, reduced_motion=static_tip)
-            tip_y = 60 + tip_dy
-            draw_tip_line(p, self.tip_parts_at(now), x, tip_y, highlight_alpha=tip_alpha)
-            draw_tip_line(p, ('Hold ', 'Start + Back', ' for 2 seconds to open the game menu (XInput controllers).'),
-                          x, tip_y + 28, highlight_alpha=tip_alpha)
         p.text('overline', 'STAR WARS', x + 2, 160, ACCENT)
         p.text('display', 'Galactic Racer', x - 2, 176, INK, max_width=760)
         if self.state == State.PLAYING:
@@ -2588,7 +2302,7 @@ class LauncherUI:
         info = self.progress_info or {}
         tool = self.operation == 'tool'
         game = self.operation in GAME_OPERATIONS
-        title = 'Updating sable-loop' if tool else ('Updating the game' if self.operation == 'update' else f'Installing {GAME_NAME}')
+        title = 'Updating the launcher' if tool else ('Updating the game' if self.operation == 'update' else f'Installing {GAME_NAME}')
         pct = self.game_progress_pct if game else info.get('pct')
         if not game and pct is None and info.get('phase') != 'Verifying the download...':
             match = re.search(r'(\d{1,3})%', self.progress)
@@ -2656,7 +2370,7 @@ class LauncherUI:
             self.draw_rows(p, buttons[first:first + visible], x, top, w, 52, 8, dt, first=first)
             p.text('caption', self.free_space_text(), x, 604, INK_FAINT, max_width=w)
         elif self.screen == 'folder':
-            p.text('overline', 'INSTALL LOCATION', x, 168, INK_DIM)
+            p.text('overline', 'INSTALL LOCATION', x, 168, ACCENT)
             p.text('body', str(self.folder), x, 192, INK, max_width=w, middle=True)
             choices = [label for label in buttons if label in ('Use existing folder', 'Use default folder')]
             card_w = (w - 16) // 2 if len(choices) == 2 else w
@@ -2697,140 +2411,6 @@ class LauncherUI:
             p.text('caption', self.status, x + 18, 630, INK_DIM, max_width=w - 18)
         self.draw_hints(p, [('A / ENTER', 'Select'), ('B / ESC', 'Back')])
 
-    GFX_ACTION_HELP = {'Recommended for this PC': "DLSS (NVIDIA RTX) or FSR 3.1 Performance with frame generation and pacing, picked for this PC's graphics card.",
-                       'Reset to game defaults': "Every option back to the game's own default. Your controls and bindings stay.",
-                       'Back': 'Back to the launcher settings.'}
-
-    def gfx_layout(self):
-        """(kind, payload, top, height) for the scrolling list: group headings and option rows."""
-        rows, y, group = [], 0, None
-        for i, o in enumerate(self.gfx_options):
-            if o.group != group:
-                group = o.group
-                y += 12 if rows else 0
-                rows.append(('heading', group, y, 30))
-                y += 30
-            rows.append(('option', len(self.GFX_ACTIONS) + i, y, 44))
-            y += 50
-        return rows, y
-
-    def draw_graphics(self, p, dt):
-        p.scene(scrim=215)
-        x, w = MARGIN, CANVAS[0] - 2 * MARGIN
-        values, picker = self.gfx_values, self.gfx_picker
-        p.text('overline', 'SETTINGS · GAME', x + 2, 56, ACCENT)
-        p.text('title', 'Graphics', x, 74, INK, max_width=400)
-        p.text('caption', str(game_settings.ini_path(self.folder)), x + w, 96, INK_FAINT, max_width=560, align='right', middle=True)
-        # Action buttons along the top.
-        ax, ay, ah = x, 138, 44
-        for i, label in enumerate(self.GFX_ACTIONS):
-            aw = p.measure('button', label)[0] + 40
-            focused = picker is None and self.focus == i
-            hovered = picker is None and getattr(self, 'hover', None) == i
-            p.fill(ax, ay, aw, ah, SURFACE_FOCUS if focused or hovered else SURFACE_HI, 255 if focused else 220 if hovered else 200, 10)
-            if focused:
-                p.ring(ax - FOCUS_GAP, ay - FOCUS_GAP, aw + 2 * FOCUS_GAP, ah + 2 * FOCUS_GAP, ACCENT, 255, 10 + FOCUS_GAP, 2)
-            p.text('button', label, ax + 20, ay + (ah - p.height('button')) // 2, ACCENT if i == 0 else INK)
-            if picker is None:
-                self.hits.append((ax, ay, aw, ah, i))
-            ax += aw + 12
-        # The scrolling, grouped option list.
-        rows, total = self.gfx_layout()
-        view_top, view_h = 200, 384
-        target = getattr(self, 'gfx_scroll_target', 0)
-        if self.focus < len(self.GFX_ACTIONS):
-            target = 0
-        for kind, idx, top, h in rows:
-            if kind == 'option' and idx == self.focus:
-                target = min(target, top - 42)
-                target = max(target, top + h + 12 - view_h)
-        target = max(0, min(target, max(0, total - view_h)))
-        self.gfx_scroll_target = target
-        scroll = target
-        s = p.s
-        s.SDL_RenderSetClipRect(p.r, s.SDL_Rect(x - FOCUS_GAP - 2, view_top, w + 2 * FOCUS_GAP + 4, view_h))
-        focus_y = None
-        for kind, idx, top, h in rows:
-            y = view_top + top - scroll
-            if y + h < view_top or y > view_top + view_h:
-                continue
-            if kind == 'heading':
-                p.text('overline', idx.upper(), x + 2, y + 10, ACCENT)
-                continue
-            hovered = picker is None and getattr(self, 'hover', None) == idx
-            p.fill(x, y, w, h, SURFACE_FOCUS if hovered else SURFACE_HI, 220 if hovered else 150, 10)
-            if idx == self.focus and picker is None:
-                focus_y = y
-        if focus_y is not None:
-            fy = focus_y
-            p.fill(x, fy, w, 44, SURFACE_FOCUS, 255, 10)
-            p.ring(x - FOCUS_GAP, fy - FOCUS_GAP, w + 2 * FOCUS_GAP, 44 + 2 * FOCUS_GAP, ACCENT, 255, 10 + FOCUS_GAP, 2)
-        for kind, idx, top, h in rows:
-            y = view_top + top - scroll
-            if kind != 'option' or y + h < view_top or y > view_top + view_h:
-                continue
-            opt = self.gfx_option(idx)
-            value = values.get(opt.key, opt.default)
-            lock = game_settings.lock_reason(opt.key, values)
-            focused = idx == self.focus and picker is None
-            mid = y + (h - p.height('body')) // 2
-            right = x + w - 20
-            if focused:
-                right -= p.text('body', '›', right, mid, ACCENT, align='right') + 10
-            label = game_settings.display_value(opt, value, values, self.gfx_schema)
-            vw = p.text('body', label, right, mid, INK_FAINT if lock else (ACCENT if focused else INK), max_width=300, align='right')
-            right -= vw + 10
-            if focused:
-                right -= p.text('body', '‹', right, mid, ACCENT, align='right') + 14
-            if lock:
-                right -= p.text('caption', lock, right, y + (h - p.height('caption')) // 2, INK_FAINT, max_width=280, align='right') + 16
-            elif opt.restart:
-                right -= p.text('caption', 'after restart', right, y + (h - p.height('caption')) // 2, INK_FAINT, align='right') + 16
-            p.text('button', opt.label, x + 20, y + (h - p.height('button')) // 2, INK if focused else (210, 215, 221), max_width=right - x - 30)
-            if picker is None and y >= view_top and y + h <= view_top + view_h:
-                self.hits.append((x, y, w, h, idx))
-        s.SDL_RenderSetClipRect(p.r, None)
-        if total > view_h:
-            thumb = max(40, view_h * view_h // total)
-            ty = view_top + (view_h - thumb) * scroll / max(1, total - view_h)
-            p.fill(x + w + 14, view_top, 4, view_h, (255, 255, 255), 25, 2)
-            p.fill(x + w + 14, ty, 4, thumb, ACCENT, 200, 2)
-        # Help for the focused row, then the status line.
-        opt = self.gfx_schema[picker] if picker is not None else self.gfx_option()
-        help_text = opt.desc if opt else self.GFX_ACTION_HELP.get(self.GFX_ACTIONS[min(self.focus, len(self.GFX_ACTIONS) - 1)], '')
-        if opt and opt.key == 'frame_generation_by' and self.gfx_schema is game_settings.BY_KEY_043:
-            help_text = 'Use F1 or Insert in-game for NVIDIA DLSS FG; the game checks your GPU and driver.'
-        p.text('caption', help_text, x, 598, INK_DIM, max_width=w)
-        if self.status:
-            p.circle(x + 5, 628 + p.height('caption') // 2, 4, self.status_tone())
-            p.text('caption', self.status, x + 18, 628, INK_DIM, max_width=w - 18)
-        if picker is not None:
-            self.draw_gfx_picker(p, dt)
-            self.draw_hints(p, [('A / ENTER', 'Choose'), ('B / ESC', 'Cancel')])
-        else:
-            self.draw_hints(p, [('A / ENTER', 'Change'), ('← / →', 'Adjust'), ('B / ESC', 'Back')])
-
-    def draw_gfx_picker(self, p, dt):
-        opt = self.gfx_schema[self.gfx_picker]
-        labels = self.buttons()
-        visible = min(10, len(labels))
-        first = max(0, min(self.focus - visible // 2, len(labels) - visible))
-        p.fill(0, 0, *CANVAS, SURFACE, 170)
-        pw, rh, gap = 460, 40, 6
-        ph = 84 + visible * (rh + gap)
-        px, py = (CANVAS[0] - pw) // 2, max(40, (CANVAS[1] - ph) // 2 - 10)
-        p.fill(px, py, pw, ph, SURFACE, 250, 16)
-        p.ring(px, py, pw, ph, SURFACE_FOCUS, 255, 16, 2)
-        p.text('overline', 'CHOOSE A VALUE', px + 24, py + 18, ACCENT)
-        p.text('heading', opt.label, px + 24, py + 36, INK, max_width=pw - 48)
-        top = py + 72
-        self.draw_rows(p, labels[first:first + visible], px + 20, top, pw - 40, rh, gap, dt, first=first)
-        allowed = self.gfx_allowed(opt.key)
-        current = self.gfx_values.get(opt.key, opt.default)
-        if current in allowed[first:first + visible]:
-            i = allowed.index(current) - first
-            p.text('caption', 'Current', px + pw - 40, top + i * (rh + gap) + (rh - p.height('caption')) // 2, ACCENT, align='right')
-
     def render(self, p, dt):
         self.hits = []
         if self.state == State.PLAYING and self.screen in ('main', 'settings', 'folder', 'error', 'update'):
@@ -2843,7 +2423,6 @@ class LauncherUI:
             self.focus = count - 1
         if self.screen == 'main': self.draw_hero(p, dt)
         elif self.screen == 'progress': self.draw_progress(p, dt)
-        elif self.screen == 'graphics': self.draw_graphics(p, dt)
         else: self.draw_panel(p, dt)
         if self.quit_button is not None:
             left, top, width, height = self.quit_button.rect
@@ -2867,7 +2446,7 @@ class LauncherUI:
 
     def screenshot_scenes(self):
         """Realistic fake states for the --screenshot design/regression loop."""
-        long = Path('C:/Games/' + 'Very Long Game Folder Name/' * 8 + 'sable-loop-game')
+        long = Path('C:/Games/' + 'Very Long Game Folder Name/' * 8 + GAME_FOLDER_NAME)
         def scene(name, screen, state, status='', focus=0, **values):
             def setup():
                 self.state, self.status = state, status
@@ -2876,39 +2455,19 @@ class LauncherUI:
                 for key, value in values.items(): setattr(self, key, value)
                 self.focus = focus
             return name, setup
-        defaults = {o.key: o.default for o in game_settings.OPTIONS}
-        dlss_values = dict(defaults, **{k: int(v) for k, v in game_settings.PRESET_DLSS.items() if k in game_settings.BY_KEY})
-        fsr_values = dict(defaults, **{k: int(v) for k, v in game_settings.PRESET_FSR.items() if k in game_settings.BY_KEY}, hdr=1, output_res=2)
-        values_043 = {o.key: o.default for o in game_settings.OPTIONS_043}
-        values_043.update(dlss=1, frame_generation=2, hdr=2, hdr_tone_mapper=1)
-        focus_043 = len(self.GFX_ACTIONS) + next(i for i, o in enumerate(game_settings.OPTIONS_043)
-                                                if o.key == 'frame_generation_by')
         return [
-            scene('main', 'main', State.READY, 'sable-loop is up to date.'),
+            scene('main', 'main', State.READY, f'{GAME_NAME} is up to date.'),
             scene('playing', 'main', State.PLAYING, 'Playing...'),
             scene('hero-download', 'main', State.NOT_INSTALLED, 'Game data: 2026.11.16', folder=long),
             scene('progress', 'progress', State.DOWNLOADING, operation='download', _game_progress_pct=63,
                   progress='Downloading game files', progress_info={'done': 19300000000, 'total': 30871262365, 'game_detail': game_progress_detail(
                       {'phase': 'Downloading', 'speed': 23218411, 'done': 19300000000, 'total': 30871262365})}),
-            scene('tool-update', 'progress', State.READY, operation='tool', progress_info={}, progress='Updating sable-loop…'),
-            scene('settings', 'settings', State.READY, 'sable-loop is up to date.', focus=2, folder=long),
-            scene('settings-back', 'settings', State.READY, 'sable-loop is up to date.', focus=7, folder=long),
+            scene('tool-update', 'progress', State.READY, operation='tool', progress_info={}, progress='Updating the launcher…'),
+            scene('settings', 'settings', State.READY, f'{GAME_NAME} is up to date.', focus=2, folder=long),
+            scene('settings-back', 'settings', State.READY, f'{GAME_NAME} is up to date.', focus=6, folder=long),
             scene('folder', 'folder', State.NOT_INSTALLED, '', focus=1, folder=long),
             scene('update', 'update', State.UPDATE_AVAILABLE),
             scene('error', 'error', State.ERROR, operation='download', last_error='Could not reach the update server. The connection stalled three times while downloading whole-07.bin from objects.githubusercontent.com; check your network and try again.'),
-            scene('graphics', 'graphics', State.READY, 'Frame generation: Auto · saved', focus=len(self.GFX_ACTIONS) + 1,
-                  gfx_values=dlss_values, gfx_picker=None, gfx_dlss_ok=True),
-            scene('graphics-fsr', 'graphics', State.READY, 'Recommended applied: FSR 3.1 Performance', focus=len(self.GFX_ACTIONS) + 16,
-                  gfx_values=fsr_values, gfx_picker=None, gfx_dlss_ok=False, folder=long),
-            scene('graphics-actions', 'graphics', State.READY, 'Saved to the game at once. In game: F1 or Insert opens its menu; its last row, Quit (A twice), exits the game.', focus=0,
-                  gfx_values=dlss_values, gfx_picker=None, gfx_dlss_ok=True),
-            scene('graphics-picker', 'graphics', State.READY, '', focus=1, gfx_values=dlss_values, gfx_picker='frame_generation',
-                  gfx_return=len(self.GFX_ACTIONS) + 5, gfx_dlss_ok=True),
-            scene('graphics-v043', 'graphics', State.READY, '', focus=focus_043, gfx_values=values_043,
-                  gfx_options=game_settings.OPTIONS_043, gfx_schema=game_settings.BY_KEY_043, gfx_picker=None),
-            scene('graphics-v043-hdr-picker', 'graphics', State.READY, '', focus=123, gfx_values=values_043,
-                  gfx_options=game_settings.OPTIONS_043, gfx_schema=game_settings.BY_KEY_043,
-                  gfx_picker='psychov35_ui_brightness'),
         ]
 
     def run(self, screenshot=None):
@@ -2947,7 +2506,6 @@ class LauncherUI:
         renderer_info = s.SDL_RendererInfo()
         flags = (renderer_info.flags
                  if s.SDL_GetRendererInfo(renderer, ctypes.byref(renderer_info)) == 0 else 0)
-        self.tip_motion_supported = bool(flags & s.SDL_RENDERER_ACCELERATED)
         s.SDL_RenderSetLogicalSize(renderer, 1280, 720)
         s.SDL_SetRenderDrawColor(renderer, *SURFACE, 255)
         s.SDL_RenderClear(renderer)
@@ -3050,7 +2608,7 @@ class LauncherUI:
                     elif typ == s.SDL_KEYDOWN and not event.key.repeat:
                         action = {s.SDLK_UP:'up',s.SDLK_w:'up',s.SDLK_DOWN:'down',s.SDLK_s:'down',s.SDLK_LEFT:'left',s.SDLK_a:'left',s.SDLK_RIGHT:'right',s.SDLK_d:'right',s.SDLK_RETURN:'accept',s.SDLK_SPACE:'accept',s.SDLK_ESCAPE:'back',s.SDLK_BACKSPACE:'back',s.SDLK_F1:'menu',s.SDLK_TAB:'menu'}.get(event.key.keysym.sym)
                         if action: self.action(action)
-                    elif typ == s.SDL_MOUSEWHEEL and self.screen in ('graphics', 'settings'):
+                    elif typ == s.SDL_MOUSEWHEEL and self.screen == 'settings':
                         for _ in range(min(5, abs(event.wheel.y))): self.action('up' if event.wheel.y > 0 else 'down')
                     elif typ in (s.SDL_MOUSEMOTION, s.SDL_MOUSEBUTTONUP):
                         mx = event.motion.x if typ == s.SDL_MOUSEMOTION else event.button.x

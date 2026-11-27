@@ -2945,39 +2945,8 @@ def install_game(s, man: dict, root: Path, dry_run: bool = False, prune: bool = 
             path.unlink()
 
 
-def graphics_command(folder: Path, sets: list[str]) -> int:
-    """--graphics: apply each KEY=VALUE (by number or by its label), then print every option as JSON."""
-    values = game_settings.read_values(folder)
-    schema = game_settings.BY_KEY_043 if game_settings.options_for(folder) is game_settings.OPTIONS_043 else game_settings.BY_KEY
-    for item in sets:
-        key, _, raw = item.partition('=')
-        opt = schema.get(key.strip())
-        if opt is None:
-            print(f"unknown setting: {key}", file=sys.stderr)
-            return 2
-        raw = raw.strip()
-        allowed = game_settings.allowed(opt.key, game_settings.dlss_available(folder), schema=schema, current=values)
-        labels = {opt.text(v).casefold(): v for v in allowed} if not opt.ranged else {}
-        labels.update((game_settings.display_value(opt, v, values, schema).casefold(), v)
-                      for v in allowed if not opt.ranged)
-        if raw.casefold() in labels:
-            value = labels[raw.casefold()]
-        else:
-            try:
-                value = int(raw)
-            except ValueError:
-                print(f"bad value for {key}: {raw}", file=sys.stderr)
-                return 2
-        if value not in allowed:
-            print(f"{key}={raw} is not allowed (min {opt.low}, max {opt.high})", file=sys.stderr)
-            return 2
-        values = game_settings.set_value(folder, opt.key, value, values)
-    print(json.dumps(game_settings.describe(folder), indent=2))
-    return 0
-
-
 def default_game_folder() -> str:
-    return str(Path(os.environ.get('USERPROFILE', str(Path.home()))) / 'Games' / 'sable-loop-game')
+    return str(Path(os.environ.get('USERPROFILE', str(Path.home()))) / 'Games' / 'STAR WARS Galactic Racer')
 
 
 UPDATE_LOG = Path(os.environ.get('LOCALAPPDATA', str(Path.home()))) / 'sable-loop' / 'game-update-cli.log'
@@ -3213,10 +3182,6 @@ def main() -> int:
     ap.add_argument('--update-on-launch', action='store_true')
     ap.add_argument('--builder-flow', action='store_true',
                     help='old flow: download the game dump and open the builder')
-    ap.add_argument('--graphics', nargs='?', const=default_game_folder(), metavar='FOLDER',
-                    help="print the game's settings (hookshot_options.ini) as JSON and exit")
-    ap.add_argument('--set', action='append', default=[], metavar='KEY=VALUE',
-                    help='with --graphics: change a setting first (repeatable)')
     ap.add_argument('--uninstall', action='store_true', help='Remove the installed game and launcher')
     ap.add_argument('--keep-saves', action='store_true', help='Compatibility alias; saves are kept by default')
     ap.add_argument('--purge-saves', action='store_true', help='Remove saved games as well when uninstalling')
@@ -3248,8 +3213,6 @@ def main() -> int:
     if a.print_sources:
         print(json.dumps(load_manifest(a.manifest), indent=2))
         return 0
-    if a.graphics is not None:
-        return graphics_command(Path(a.graphics).expanduser(), a.set)
 
     global _UI_READY
     _UI_READY = True
