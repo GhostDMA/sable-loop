@@ -325,7 +325,7 @@ class Progress:
 
 
 def _log_location() -> Path:
-    for folder in (HERE, Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "SilverLantern"):
+    for folder in (HERE, Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "sable-loop"):
         try:
             folder.mkdir(parents=True, exist_ok=True)
             p = folder / LOG_NAME
@@ -511,7 +511,7 @@ def friendly(exc: BaseException, resumable_bytes: int = 0) -> UserError:
                              'Leave this window open - it usually finishes by itself - or allow this app in your antivirus and press Retry.',
                              'file in use', resumable_bytes)
         action = ("Wait a minute and run this again. If it keeps happening, allow "
-                  "SilverLantern.exe in your antivirus.")
+                  "sable-loop-launcher.exe in your antivirus.")
         return UserError(f"Windows wouldn't let this tool use {name}. Usually antivirus is still scanning it.",
                          action, "file in use", resumable_bytes)
     status = _http_status(exc)
@@ -528,7 +528,7 @@ def friendly(exc: BaseException, resumable_bytes: int = 0) -> UserError:
                          "no connection", resumable_bytes)
     text = str(exc).lower()
     if "builder checksum" in text or "has no " in text:
-        return UserError("The HeyListen Builder download didn't check out.",
+        return UserError("The builder download didn't check out.",
                          "Run this again. If it repeats, tell the person who sent you this tool.", "bad download")
     if any(marker in text for marker in ('checksum mismatch', 'sha-256 mismatch', 'size mismatch',
                                           'short segment', 'staged update failed verification')):
@@ -1009,16 +1009,16 @@ def download_builder(s: "requests.Session", man: dict, out: Path, force: bool = 
 
     if not force and state.get("release") == tag and have and have == want:
         log(f"Builder already current: {tag}")
-        step("HeyListen Builder")
+        step("Game builder")
         done(f"up to date ({tag})")
         return builder
 
     size = assets[asset_name]["size"]
     log(f"Downloading {asset_name} ({tag}, {human(size)})")
-    step("HeyListen Builder")
+    step("Game builder")
     done(f"downloading {human(size)}", None)
     tmp = builder.with_suffix(builder.suffix + ".part")
-    bar = Progress("HeyListen Builder", size)
+    bar = Progress("Game builder", size)
     try:
         stream_to(s, assets[asset_name]["browser_download_url"], tmp, expect=size, progress=bar.add)
     finally:
@@ -1031,7 +1031,7 @@ def download_builder(s: "requests.Session", man: dict, out: Path, force: bool = 
     state.update({"release": tag, "builder_sha256": got, "updated": time.strftime("%Y-%m-%dT%H:%M:%S")})
     state_file.write_text(json.dumps(state, indent=2))
     log(f"Builder ready and checksum-verified: {tag}")
-    step("HeyListen Builder")
+    step("Game builder")
     done(f"ready ({tag})")
     return builder
 
@@ -1547,7 +1547,7 @@ def stage_executable(zpath: Path, directory: Path, name: str) -> Path:
             if not entry.is_dir():
                 candidates.setdefault(parts[-1].casefold(), []).append(entry)
         selected = None
-        for candidate in (name, 'SilverLantern.exe', 'HeyListen-Get.exe'):
+        for candidate in (name, 'sable-loop-launcher.exe'):
             matches = candidates.get(candidate.casefold(), [])
             if matches:
                 if len(matches) != 1:
@@ -2908,7 +2908,7 @@ def install_game(s, man: dict, root: Path, dry_run: bool = False, prune: bool = 
             if not path.is_file() or path.is_symlink():
                 continue
             relative = path.relative_to(root)
-            if (relative.as_posix().casefold() == 'ocarina of time.exe'
+            if (relative.as_posix().casefold() == 'sable-loop-launcher.exe'
                     or relative.parts[0].casefold() == '.heylisten-get'
                     or any(x.casefold() == 'user' for x in relative.parts[:-1])
                     or (keep_assets and relative.parts[0].casefold() == '.heylisten-parts')):
@@ -3038,11 +3038,11 @@ def relocate_transient() -> bool:
     temp = Path(os.environ['TEMP']).resolve()
     if not source.is_relative_to(temp):
         return False
-    target = Path(os.environ.get('LOCALAPPDATA', str(Path.home()))) / 'Programs' / 'Silver Lantern' / 'SilverLantern.exe'
+    target = Path(os.environ.get('LOCALAPPDATA', str(Path.home()))) / 'Programs' / 'sable-loop' / 'sable-loop-launcher.exe'
     target.parent.mkdir(parents=True, exist_ok=True)
     staging = None
     try:
-        with tempfile.NamedTemporaryFile(prefix='SilverLantern-', suffix='.tmp', dir=target.parent, delete=False) as stream:
+        with tempfile.NamedTemporaryFile(prefix='sable-loop-launcher-', suffix='.tmp', dir=target.parent, delete=False) as stream:
             staging = Path(stream.name)
             with source.open('rb') as original:
                 while True:
@@ -3149,10 +3149,10 @@ def main() -> int:
                 raise
     if len(sys.argv) >= 5 and sys.argv[1] == "--apply-update-internal":
         global LOG_PATH
-        LOG_PATH = Path(sys.argv[2]).parent / 'HeyListen-Get.log'
+        LOG_PATH = Path(sys.argv[2]).parent / LOG_NAME
         _apply_update(Path(sys.argv[2]), Path(sys.argv[3]), int(sys.argv[4]), sys.argv[5:])
         return 0
-    ap = argparse.ArgumentParser(description="One-click HeyListen + game downloader")
+    ap = argparse.ArgumentParser(description="sable-loop game downloader")
     ap.add_argument('--gui', action='store_true', help=argparse.SUPPRESS)
     ap.add_argument('--internal-trust-check', action='store_true', help=argparse.SUPPRESS)
     ap.add_argument("--manifest", help="sources.json path or URL (default: next to this script)")
@@ -3162,7 +3162,7 @@ def main() -> int:
     ap.add_argument("--game-only", action="store_true")
     ap.add_argument("--skip-hash", action="store_true", help="skip the 25 GB SHA-256 check")
     ap.add_argument("--force", action="store_true", help="re-download even if present")
-    ap.add_argument("--no-launch", action="store_true", help="don't open HeyListenBuilder.exe")
+    ap.add_argument("--no-launch", action="store_true", help="don't open the game builder")
     ap.add_argument("--no-preset", action="store_true", help="don't write the upscaler preset ini")
     ap.add_argument("--game-dir", default=None,
                     help="built game folder for the upscaler preset")
@@ -3185,7 +3185,7 @@ def main() -> int:
     ap.add_argument('--force-update', action='store_true')
     ap.add_argument('--update-on-launch', action='store_true')
     ap.add_argument('--builder-flow', action='store_true',
-                    help='old flow: download the game dump + HeyListenBuilder and open the Builder')
+                    help='old flow: download the game dump and open the builder')
     ap.add_argument('--graphics', nargs='?', const=default_game_folder(), metavar='FOLDER',
                     help="print the game's settings (hookshot_options.ini) as JSON and exit")
     ap.add_argument('--set', action='append', default=[], metavar='KEY=VALUE',
@@ -3229,9 +3229,9 @@ def main() -> int:
     ui_init(a.plain)
     builder_flow = bool(a.builder_flow or a.builder_only or a.game_only or a.manifest or a.out or a.skip_hash)
     say()
-    say(f"HeyListen {APP_VERSION}", "bold")
+    say(f"sable-loop {APP_VERSION}", "bold")
     if builder_flow:
-        say("Downloads the game data and the HeyListen Builder, then opens the Builder.")
+        say("Downloads the game data and builder, then opens the builder.")
     elif a.install_game is not None:
         say("Installs or updates the game files.")
     else:
@@ -3344,7 +3344,7 @@ def finish_lines(folder: Path, launched: bool, preset: str | None = None,
         if target is not None:
             lines.append(f"  1. Start the game: double-click {target.relative_to(folder).as_posix()} in the folder above.")
         else:
-            lines.append("  1. Start the game from the HeyListen launcher.")
+            lines.append("  1. Start the game from the sable-loop launcher.")
     lines.append("  2. For game updates later, run this tool again. It only downloads")
     lines.append("     what changed.")
     if preset:
@@ -3394,7 +3394,7 @@ def run_builder_flow(s, a) -> int:
         done("failed", "yellow")
         log(f"manifest: {e}")
         raise UserError("This tool's files are incomplete.",
-                        "Extract the whole zip into a folder again and run SilverLantern.exe from there.")
+                        "Extract the whole zip into a folder again and run sable-loop-launcher.exe from there.")
     done("up to date" if _MANIFEST_ORIGIN == "url" else "using saved copy",
          "green" if _MANIFEST_ORIGIN == "url" else "dim")
     tool = man.get("tool", {})
@@ -3416,7 +3416,7 @@ def run_builder_flow(s, a) -> int:
     say("-" * 70)
     proc = None
     if builder and not a.no_launch:
-        say("Everything is downloaded. The HeyListen Builder is opening now.")
+        say("Everything is downloaded. The game builder is opening now.")
         log(f"Opening {builder}")
         proc = subprocess.Popen([str(builder)], cwd=str(builder.parent))
     else:

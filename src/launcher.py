@@ -384,13 +384,13 @@ def shortcut_path():
 
 def launcher_target(folder):
     folder = Path(folder)
-    fallback = Path(os.environ.get('LOCALAPPDATA', str(Path.home()))) / 'Programs' / 'Ocarina of Time'
+    fallback = STATE_DIR.parent / 'Programs' / 'sable-loop'
     if getattr(sys, 'frozen', False):
         running = Path(sys.executable).resolve()
         if (running.parent in (folder.resolve(), fallback.resolve())
-                and re.fullmatch(r'Ocarina of Time(?:-[^/\\]+)?\.exe', running.name, re.IGNORECASE)):
+                and re.fullmatch(r'sable-loop-launcher(?:-[^/\\]+)?\.exe', running.name, re.IGNORECASE)):
             return running
-    return folder / 'Ocarina of Time.exe'
+    return folder / 'sable-loop-launcher.exe'
 
 
 def create_shortcut(folder, enabled=True, exe=None):
@@ -561,7 +561,7 @@ def start_menu_path():
 
 
 UNINSTALL_KEY = _TEST_REG_ROOT.rstrip('\\') + r'\sable-loop'
-OWNED_FILES = ('SilverLantern.exe', 'HeyListen-Get.exe', 'SDL2.dll', 'sources.json',
+OWNED_FILES = ('sable-loop-launcher.exe', 'sable-loop.log', 'sable-loop-launcher.exe.update-backup', 'SDL2.dll', 'sources.json',
                'README.md', 'Apply-HeyListen-Preset.ps1', 'SilverLantern-Get.cmd',
                'SilverLantern-Preset.cmd', 'Update-Game.ps1', 'Watch-Game.ps1',
                'SilverLantern-AutoUpdate.cmd', 'sources.cache.json', 'HeyListen-Get.log',
@@ -874,7 +874,7 @@ def _cleanup_stale_siblings(destination, keep):
     keep = Path(keep).resolve()
     running = Path(sys.executable).resolve() if getattr(sys, 'frozen', False) else None
     for name, digest in list(records.items()):
-        if not isinstance(name, str) or not re.fullmatch(r'Ocarina of Time-[^/\\]+\.exe', name, re.IGNORECASE):
+        if not isinstance(name, str) or not re.fullmatch(r'sable-loop-launcher-[^/\\]+\.exe', name, re.IGNORECASE):
             continue
         stale = destination / name
         try:
@@ -891,20 +891,20 @@ def relocate_launcher(folder):
     if not getattr(sys, 'frozen', False):
         return False
     source = Path(sys.executable).resolve()
-    fallback = Path(os.environ.get('LOCALAPPDATA', str(Path.home()))) / 'Programs' / 'Ocarina of Time'
+    fallback = STATE_DIR.parent / 'Programs' / 'sable-loop'
     try:
         probe_writable(folder)
         destination = Path(folder)
     except OSError:
         destination = fallback
         probe_writable(destination)
-    target = destination / 'Ocarina of Time.exe'
+    target = destination / 'sable-loop-launcher.exe'
     if source == target.resolve():
         return False
     if target.exists():
         destination = fallback
         probe_writable(destination)
-        target = destination / 'Ocarina of Time.exe'
+        target = destination / 'sable-loop-launcher.exe'
         if source.parent == destination.resolve():
             return False
     import game_channel
@@ -916,7 +916,7 @@ def relocate_launcher(folder):
             # Never overwrite or run an executable whose ownership is unknown.
             import tempfile
             with source.open('rb') as original, tempfile.NamedTemporaryFile(
-                    prefix='Ocarina of Time-', suffix='.exe', dir=destination, delete=False) as copy:
+                    prefix='sable-loop-launcher-', suffix='.exe', dir=destination, delete=False) as copy:
                 target = Path(copy.name)
                 try:
                     shutil.copyfileobj(original, copy)
@@ -956,7 +956,7 @@ def schedule_owned_cleanup():
 
 def confirm_uninstall(message, gui=False):
     if gui and os.name == 'nt':
-        return ctypes.windll.user32.MessageBoxW(None, message, 'Uninstall HeyListen', 0x24) == 6
+        return ctypes.windll.user32.MessageBoxW(None, message, 'Uninstall sable-loop', 0x24) == 6
     log_message(message)
     return input('Continue? [y/N] ').strip().lower() == 'y'
 
@@ -981,7 +981,7 @@ def uninstall(keep_saves=True, purge_saves=False, gui=False):
         except TimeoutError:
             message = 'An installation or update is in progress. Please wait for it to finish, then retry uninstall.'
             if gui and os.name == 'nt':
-                ctypes.windll.user32.MessageBoxW(None, message, 'Uninstall HeyListen', 0x30)
+                ctypes.windll.user32.MessageBoxW(None, message, 'Uninstall sable-loop', 0x30)
             log_message(message)
             return False
         try:
@@ -2014,7 +2014,7 @@ class LauncherUI:
         if self.operation == 'tool' and self.screen == 'progress':
             return
         self.operation = 'tool'
-        self.progress = 'Updating HeyListen…'
+        self.progress = 'Updating sable-loop…'
         self.set_screen('progress')
         args = [arg for arg in sys.argv[1:] if arg not in ('--self-update', '--no-self-update')]
         if not args:
@@ -2268,8 +2268,8 @@ class LauncherUI:
                 self.save()
                 if getattr(sys, 'frozen', False) and relocate_launcher(self.folder):
                     current = Path(sys.executable).resolve()
-                    fallback = Path(os.environ.get('LOCALAPPDATA', str(Path.home()))) / 'Programs' / 'Ocarina of Time'
-                    if current.name.casefold() == 'ocarina of time.exe' and (previous and current.parent == previous.resolve() or current.parent == fallback.resolve()) and current.parent != self.folder.resolve():
+                    fallback = STATE_DIR.parent / 'Programs' / 'sable-loop'
+                    if current.name.casefold() == 'sable-loop-launcher.exe' and (previous and current.parent == previous.resolve() or current.parent == fallback.resolve()) and current.parent != self.folder.resolve():
                         schedule_owned_cleanup()
                     self.running = False
                     return
@@ -2410,7 +2410,7 @@ class LauncherUI:
                 match = re.fullmatch(r'v(\d+)\.(\d+)\.(\d+)', value)
                 if match and tuple(map(int, match.groups())) > tuple(map(int, APP_VERSION.split('.'))):
                     self.tool_update_available = True
-                    self.status = 'HeyListen update available: ' + value
+                    self.status = 'sable-loop update available: ' + value
                     if self.operation in ('game', 'download', 'update'):
                         try:
                             STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -2423,14 +2423,14 @@ class LauncherUI:
                         self.start_tool_update()
                 elif match:
                     self.tool_update_available = False
-                    self.status = 'HeyListen is up to date.'
+                    self.status = 'sable-loop is up to date.'
             elif kind == 'tool_complete':
                 # The child must exit first; its helper then waits for this GUI to exit before swapping.
                 self.running = False
             elif kind == 'tool_current':
                 self.tool_update_available = False
                 self.operation = None
-                self.status = 'HeyListen is up to date.'
+                self.status = 'sable-loop is up to date.'
                 self.set_screen('main')
             elif kind == 'graphics':
                 message, values = value
@@ -2847,7 +2847,7 @@ class LauncherUI:
 
     def screenshot_scenes(self):
         """Realistic fake states for the --screenshot design/regression loop."""
-        long = Path('C:/Games/' + 'Very Long Game Folder Name/' * 8 + 'Ocarina of Time')
+        long = Path('C:/Games/' + 'Very Long Game Folder Name/' * 8 + 'sable-loop-game')
         def scene(name, screen, state, status='', focus=0, **values):
             def setup():
                 self.state, self.status = state, status
@@ -2864,15 +2864,15 @@ class LauncherUI:
         focus_043 = len(self.GFX_ACTIONS) + next(i for i, o in enumerate(game_settings.OPTIONS_043)
                                                 if o.key == 'frame_generation_by')
         return [
-            scene('main', 'main', State.READY, 'HeyListen is up to date.'),
+            scene('main', 'main', State.READY, 'sable-loop is up to date.'),
             scene('playing', 'main', State.PLAYING, 'Playing...'),
             scene('hero-download', 'main', State.NOT_INSTALLED, 'Game data: 2026.11.16', folder=long),
             scene('progress', 'progress', State.DOWNLOADING, operation='download', _game_progress_pct=63,
                   progress='Downloading game files', progress_info={'game_detail': game_progress_detail(
                       {'phase': 'Downloading', 'speed': 23218411, 'done': 19300000000, 'total': 30871262365})}),
-            scene('tool-update', 'progress', State.READY, operation='tool', progress_info={}, progress='Updating HeyListen…'),
-            scene('settings', 'settings', State.READY, 'HeyListen is up to date.', focus=2, folder=long),
-            scene('settings-back', 'settings', State.READY, 'HeyListen is up to date.', focus=7, folder=long),
+            scene('tool-update', 'progress', State.READY, operation='tool', progress_info={}, progress='Updating sable-loop…'),
+            scene('settings', 'settings', State.READY, 'sable-loop is up to date.', focus=2, folder=long),
+            scene('settings-back', 'settings', State.READY, 'sable-loop is up to date.', focus=7, folder=long),
             scene('folder', 'folder', State.NOT_INSTALLED, '', focus=1, folder=long),
             scene('update', 'update', State.UPDATE_AVAILABLE),
             scene('error', 'error', State.ERROR, operation='download', last_error='Could not reach the update server. The connection stalled three times while downloading whole-07.bin from objects.githubusercontent.com; check your network and try again.'),
