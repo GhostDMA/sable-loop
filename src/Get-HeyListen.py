@@ -26,6 +26,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import re
 import shutil
 import stat
@@ -39,6 +40,7 @@ import zipfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import quote, urlparse
 import qa_pause
@@ -519,7 +521,7 @@ def friendly(exc: BaseException, resumable_bytes: int = 0) -> UserError:
         return UserError("All download links are currently unavailable.",
                          "Try again later. The links update automatically once the tool's author fixes them.",
                          "link no longer works", resumable_bytes)
-    if status is not None and (status == 429 or 500 <= status < 600):
+    if status is not None and (status in (408, 429) or 500 <= status < 600):
         return UserError("The download site is busy right now.", "Wait about 10 minutes and run this again.",
                          "the site is busy", resumable_bytes)
     if _is_network(exc):
@@ -872,7 +874,7 @@ def check_disk_space(folder: Path, need: int, label: str = "Free space") -> None
         done("not enough", "yellow")
         gap = need - free
         raise UserError(
-            f"Not enough free space on {drive}. The download needs {human(need)}, and {human(free)} is free.",
+            f"Not enough free space on {drive}: {need:,} bytes required, {free:,} bytes free.",
             f"Free up about {human(gap)} (empty the Recycle Bin, or delete old files from Downloads), "
             "then run this again.", "disk full")
     done(f"{human(free)} free, {human(need)} needed", None)
@@ -903,17 +905,39 @@ def checksum_session(source=None):
                             CurlOpt.TIMEOUT_MS: 60000, CurlOpt.MAXFILESIZE_LARGE: 65536})
 
 
+DOWNLOAD_ATTEMPTS = 6
+
+
+def retry_download(attempt, limit, exc, response=None):
+    status = getattr(response, 'status_code', None) or _http_status(exc)
+    if (attempt + 1 >= limit or _is_local_disk_error(exc) or
+            (status is not None and status >= 400 and status not in (408, 429) and not 500 <= status < 600)):
+        raise exc
+    delay = 2 ** attempt + random.uniform(0, 1)
+    if status == 429 and response is not None:
+        value = response.headers.get('retry-after') or response.headers.get('Retry-After', '')
+        try:
+            seconds = int(value) if value.isdigit() else parsedate_to_datetime(value).timestamp() - time.time()
+            delay = max(delay, seconds)
+        except (ValueError, TypeError, OverflowError):
+            pass
+    say(f'Download interrupted; retrying in {math.ceil(delay)} s ({attempt + 2}/{limit})…')
+    time.sleep(delay)
+
+
 def metadata_get(client, url, **kwargs):
     kwargs['timeout'] = (10, 60)
-    for attempt in range(2):
+    for attempt in range(DOWNLOAD_ATTEMPTS):
         check_parent_alive()
+        response = None
         try:
-            return client.get(url, **kwargs)
-        except Exception:
-            log(traceback.format_exc())
-            if attempt:
-                raise
-            say('Connection stalled — retrying…')
+            response = client.get(url, **kwargs)
+            response.raise_for_status()
+            return response
+        except Exception as exc:
+            if response is not None:
+                response.close()
+            retry_download(attempt, DOWNLOAD_ATTEMPTS, exc, response)
 
 
 # ---------------------------------------------------------------- manifest
@@ -1072,7 +1096,7 @@ def content_range_start(r) -> int | None:
 
 
 def stream_to(s: "requests.Session", url: str, dest: Path, expect: int | None = None,
-              referer: str | None = None, max_retries: int = 2, part: Path | None = None,
+              referer: str | None = None, max_retries: int = DOWNLOAD_ATTEMPTS, part: Path | None = None,
               progress=None, quiet: bool = False, on_retry=None) -> int:
     """Resumable streaming download with an isolated low-speed policy."""
     if isinstance(s, requests.Session):
@@ -1093,6 +1117,7 @@ def _stream_to(s, url, dest, expect, referer, max_retries, part, progress, quiet
         headers = {"accept": "*/*", "referer": referer or "https://buzzheavier.com/"}
         if have:
             headers["range"] = f"bytes={have}-"
+        r = None
         try:
             r = s.get(url, headers=headers, stream=True, timeout=(10, 30))
             if r.status_code == 416 and expect and have >= expect:
@@ -1139,25 +1164,19 @@ def _stream_to(s, url, dest, expect, referer, max_retries, part, progress, quiet
                             log(f"  {pct}  {human(done)} / {human(total) if total else '?'}  ({human(rate)}/s)")
             finally:
                 r.close()
-            if total and done < total and attempt < max_retries:
-                log(f"  short read ({done}/{total}), resuming...")
-                say('Connection stalled — retrying…')
-                if on_retry is not None:
-                    on_retry()
-                continue
+            if total and done < total:
+                raise ValueError(f"download size mismatch ({done}/{total})")
             break
         except Exception as e:  # noqa: BLE001
             log(traceback.format_exc())
-            if _is_local_disk_error(e) or attempt == max_retries:
-                raise   # a full disk or locked file never fixes itself by retrying
-            log(f"  network hiccup ({type(e).__name__}: {e}), retry {attempt}/{max_retries} in 3 s")
-            say('Connection stalled — retrying…')
+            if r is not None and r.status_code >= 400:
+                r.close()
+            retry_download(attempt - 1, max_retries, e, r)
             if on_retry is not None:
                 on_retry()
             note = getattr(getattr(progress, "__self__", None), "note", None)
             if note:
                 note(f"connection dropped, retrying ({attempt} of {max_retries})...")
-            time.sleep(3)
     if expect is not None and part.stat().st_size != expect:
         raise RuntimeError(f"size mismatch: {part.stat().st_size} != {expect}")
     _replace_with_retry(part, dest)
@@ -1242,7 +1261,7 @@ def parallel_download(session_factory, url, dest, size, expected_sha, progress, 
 
     def worker(i, response=None, retries_used=0):
         start, end = bounds[i]
-        for attempt in range(retries_used, 2):
+        for attempt in range(retries_used, DOWNLOAD_ATTEMPTS):
             check_parent_alive()
             r = None
             pos = start
@@ -1254,6 +1273,8 @@ def parallel_download(session_factory, url, dest, size, expected_sha, progress, 
                 else:
                     r, response = response, None
                 expected_range = f'bytes {start}-{end-1}/{size}'
+                if r.status_code >= 400:
+                    r.raise_for_status()
                 if r.status_code != 206 or (r.headers.get('content-range') or '').lower().strip() != expected_range:
                     raise ValueError('invalid chunk Content-Range')
                 digest = hashlib.sha256()
@@ -1278,9 +1299,7 @@ def parallel_download(session_factory, url, dest, size, expected_sha, progress, 
                 log(traceback.format_exc())
                 if pos > start:
                     progress.add(start - pos, received=0)
-                if attempt or _is_local_disk_error(exc):
-                    raise
-                say('Connection stalled — retrying…')
+                retry_download(attempt, DOWNLOAD_ATTEMPTS, exc, r)
                 if on_retry is not None:
                     on_retry()
             finally:
@@ -1296,20 +1315,23 @@ def parallel_download(session_factory, url, dest, size, expected_sha, progress, 
     first = pending[0]
     a, b = bounds[first]
     probe_session = session_factory()
-    for attempt in range(2):
+    for attempt in range(DOWNLOAD_ATTEMPTS):
         check_parent_alive()
+        probe = None
         try:
             probe = probe_session.get(url, headers={'range': f'bytes={a}-{b-1}', 'accept': '*/*'}, stream=True, timeout=(10, 30))
+            if probe.status_code >= 400:
+                probe.raise_for_status()
             break
-        except Exception:
-            log(traceback.format_exc())
-            if attempt:
-                raise
-            say('Connection stalled — retrying…')
+        except Exception as exc:
+            if probe is not None:
+                probe.close()
+            retry_download(attempt, DOWNLOAD_ATTEMPTS, exc, probe)
             if on_retry is not None:
                 on_retry()
     if probe.status_code == 200:
         probe.close()
+        log(f'{dest.name}: server ignored the range request; downloading in one stream.', echo=True)
         part.unlink(missing_ok=True)
         side.unlink(missing_ok=True)
         # Existing completed regions were excluded from the plan's total.
@@ -1320,7 +1342,7 @@ def parallel_download(session_factory, url, dest, size, expected_sha, progress, 
             remaining_credit -= amount
             progress.add(amount, received=n)
         retry_hook = {'on_retry': on_retry} if on_retry is not None else {}
-        stream_to(probe_session, url, dest, expect=size, progress=credit, quiet=True, max_retries=2 - attempt,
+        stream_to(probe_session, url, dest, expect=size, progress=credit, quiet=True, max_retries=DOWNLOAD_ATTEMPTS - attempt,
                   **retry_hook)
         return
     if probe.status_code != 206 or (probe.headers.get('content-range') or '').lower().strip() != f'bytes {a}-{b-1}/{size}':
@@ -1363,7 +1385,7 @@ def download_game(s: "requests.Session", man: dict, out: Path, skip_hash: bool =
         if first.get("size"):
             existing = sum(p.stat().st_size for p in out.glob(dest.name + ".*.part") if p.is_file())
             extra = first["size"] if first.get("parts") else 0
-            check_disk_space(out, max(0, first["size"] - existing) + extra + 1024 ** 3)
+            check_disk_space(out, max(0, first["size"] - existing) + extra + 2 * 1024 ** 3)
             say("(The built game needs more space later; keep extra room free.)", "dim")
         last_err = None
         prev_parts: list[Path] = []
@@ -1929,7 +1951,7 @@ def parse_game_manifest(text: str) -> dict:
 
 def load_game_manifest(s, source: str) -> dict:
     if urlparse(source).scheme in ('https', 'http'):
-        for attempt in range(2):
+        for attempt in range(DOWNLOAD_ATTEMPTS):
             check_parent_alive()
             response = None
             try:
@@ -1946,11 +1968,8 @@ def load_game_manifest(s, source: str) -> dict:
                         say(f'Fetching manifest… ({received / 1_000_000:.1f} of {total / 1_000_000:.1f} MB)' if total else f'Fetching manifest… ({received / 1_000_000:.1f} MB)')
                 text = b''.join(chunks).decode('utf-8-sig')
                 break
-            except Exception:
-                log(traceback.format_exc())
-                if attempt:
-                    raise
-                say('Connection stalled — retrying…')
+            except Exception as exc:
+                retry_download(attempt, DOWNLOAD_ATTEMPTS, exc, response)
             finally:
                 if response is not None:
                     response.close()
@@ -2753,7 +2772,7 @@ def install_game(s, man: dict, root: Path, dry_run: bool = False, prune: bool = 
         else:
             # Shared legacy bundles can remain live across multiple files.
             asset_budget = sum(uncached_asset_sizes)
-        need = sum(item['size'] for item in pending) + asset_budget + 1024 ** 3
+        need = sum(item['size'] for item in pending) + asset_budget + 2 * 1024 ** 3
         override = os.environ.get('SILVER_LANTERN_MIN_FREE_GB')
         if override is not None:
             try:
@@ -2762,10 +2781,7 @@ def install_game(s, man: dict, root: Path, dry_run: bool = False, prune: bool = 
                     raise ValueError
             except ValueError:
                 raise UserError('SILVER_LANTERN_MIN_FREE_GB must be a non-negative number.', 'Correct the environment variable and try again.', 'configuration')
-            if minimum_gb == 0:
-                need = 0
-            else:
-                need = max(need, int(minimum_gb * 1024 ** 3))
+            need = max(need, int(minimum_gb * 1024 ** 3))
         if need:
             check_disk_space(root, need)
     root.mkdir(parents=True, exist_ok=True)
@@ -2803,19 +2819,23 @@ def install_game(s, man: dict, root: Path, dry_run: bool = False, prune: bool = 
                     return
                 partial.unlink()
             url = game_asset_base() + quote(part['asset'])
-            if part['size'] >= PARALLEL_THRESHOLD and download_streams() > 1:
-                parallel_download(stream_session, url, dest, part['size'], part['sha256'], progress,
-                                  download_streams(), **retry_hook)
-            else:
-                side = Path(str(partial) + '.json')
-                if side.exists():
-                    partial.unlink(missing_ok=True)
-                    side.unlink(missing_ok=True)
-                worker = stream_session() if s is None else s
-                stream_to(worker, url, dest, expect=part['size'], progress=progress.add, quiet=True, **retry_hook)
-            if verify_bundle(dest, part['asset']) != part['sha256']:
+            for attempt in range(2):
+                if part['size'] >= PARALLEL_THRESHOLD and download_streams() > 1:
+                    parallel_download(stream_session, url, dest, part['size'], part['sha256'], progress,
+                                      download_streams(), **retry_hook)
+                else:
+                    side = Path(str(partial) + '.json')
+                    if side.exists():
+                        partial.unlink(missing_ok=True)
+                        side.unlink(missing_ok=True)
+                    worker = stream_session() if s is None else s
+                    stream_to(worker, url, dest, expect=part['size'], progress=progress.add, quiet=True, **retry_hook)
+                if verify_bundle(dest, part['asset']) == part['sha256']:
+                    break
                 dest.unlink(missing_ok=True)
-                raise ValueError(f"SHA-256 mismatch: {part['asset']}")
+                if attempt:
+                    raise ValueError(f"SHA-256 mismatch: {part['asset']}")
+                say(f"{part['asset']} failed verification; downloading a fresh copy.")
             verified_assets.add(part['asset'])
         log('Starting bundle download and installation', echo=True)
         if v2:
@@ -3469,17 +3489,20 @@ def run() -> None:
             pass
         code = main()
     except ParentExited:
-        log('parent exited; stopping')
-        sys.exit(0)
+        log('Launcher closed; stopping the download.', echo=True)
+        say('Partial downloads are kept. Run this again to resume.')
+        sys.exit(1)
     except KeyboardInterrupt:
         log("interrupted by user")
         say()
-        say("Stopped. Run this again any time. It picks up where it left off.", "dim")
+        say("Download stopped by user.", "dim")
         code = 130
     except Exception as exc:  # noqa: BLE001
         log(traceback.format_exc())
         show_error(friendly(exc))
         code = 1
+    if code:
+        say('Partial downloads are kept. Run this again to resume.')
     if _UI_READY:
         pause(no_pause)
     sys.exit(code)
