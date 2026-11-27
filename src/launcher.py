@@ -74,7 +74,7 @@ def game_manifest_url():
     return MANIFEST_URL
 
 
-APP_VERSION = '1.0.0'
+APP_VERSION = '1.0.1'
 
 
 def windows_animations_enabled():
