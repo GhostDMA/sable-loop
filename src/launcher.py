@@ -16,7 +16,6 @@ import qa_pause
 import sys
 import time
 import traceback
-import urllib.request
 import hashlib
 import base64
 try:
@@ -77,7 +76,7 @@ def game_manifest_url():
     return MANIFEST_URL
 
 
-APP_VERSION = getattr(sys.modules.get('__main__'), 'APP_VERSION', '1.8.1')
+APP_VERSION = '1.0.0'
 
 
 def play_tip_parts(folder):
@@ -319,8 +318,6 @@ def game_play_target(folder):
     try:
         with (folder / '.heylisten-get' / 'game-manifest.json').open(encoding='utf-8-sig') as source:
             manifest = json.load(source)
-    except FileNotFoundError:
-        return next((folder / name for name in names if (folder / name).is_file()), None)
     except (OSError, ValueError, UnicodeError):
         return None
     if not isinstance(manifest, dict) or not isinstance(manifest.get('files'), list):
@@ -335,7 +332,7 @@ def game_play_target(folder):
 
 
 def installed(folder):
-    return (folder / 'longshot_version.txt').is_file() and game_play_target(folder) is not None
+    return game_play_target(folder) is not None
 
 
 def probe_writable(folder):
@@ -561,13 +558,6 @@ def start_menu_path():
 
 
 UNINSTALL_KEY = _TEST_REG_ROOT.rstrip('\\') + r'\sable-loop'
-OWNED_FILES = ('sable-loop-launcher.exe', 'sable-loop.log', 'sable-loop-launcher.exe.update-backup', 'SDL2.dll', 'sources.json',
-               'README.md', 'Apply-HeyListen-Preset.ps1', 'SilverLantern-Get.cmd',
-               'SilverLantern-Preset.cmd', 'Update-Game.ps1', 'Watch-Game.ps1',
-               'SilverLantern-AutoUpdate.cmd', 'sources.cache.json', 'HeyListen-Get.log',
-               'SilverLantern.exe.update-backup', 'HeyListen-Get.exe.update-backup',
-               'Run Silver Lantern.exe', 'Run HeyListen.exe')
-OWNED_FILES += tuple('support/' + name for name in OWNED_FILES if name not in ('Run Silver Lantern.exe', 'Run HeyListen.exe'))
 
 
 def register_install(folder, exe=None):
@@ -660,44 +650,22 @@ def fetch_channel_manifest(folder, session):
         return game_channel.fetch_for_folder(folder, lambda url: game_channel.fetch_bytes(session, url), lambda data: parser.parse_game_manifest(data.decode('utf-8-sig')), legacy_url=game_manifest_url())
 
 
-def fetch_ownership_manifest():
-    with urllib.request.urlopen(game_manifest_url(), timeout=10) as response:
-        return json.load(response)
-
-
-def ownership_manifest(folder):
-    try:
-        with (folder / '.heylisten-get' / 'game-manifest.json').open(encoding='utf-8') as stream:
-            manifest = json.load(stream)
-        if not isinstance(manifest.get('files'), list):
-            raise ValueError('invalid manifest')
-        return manifest
-    except (OSError, ValueError, AttributeError):
-        try:
-            manifest = fetch_ownership_manifest()
-            return manifest if isinstance(manifest.get('files'), list) else None
-        except (OSError, ValueError, AttributeError):
-            return None
-
-
 def manifest_owned_files(folder, manifest):
     result = []
     root = folder.resolve()
-    for item in (manifest or {}).get('files', []):
-        try:
-            name = item['path']
-            if not isinstance(name, str) or '\\' in name or ':' in name:
-                continue
-            parts = name.split('/')
-            if any(part in ('', '.', '..') or part.casefold() == 'user' for part in parts):
-                continue
-            path = folder.joinpath(*parts)
-            if path.is_symlink() or not path.resolve().is_relative_to(root):
-                continue
-            if path.is_file() and path.stat().st_size == item['size']:
-                result.append(path)
-        except (OSError, KeyError, TypeError):
-            continue
+    if not isinstance(manifest, dict) or not isinstance(manifest.get('files'), list):
+        raise ValueError('invalid installed manifest')
+    for item in manifest['files']:
+        name = item['path']
+        if not isinstance(name, str) or '\\' in name or ':' in name:
+            raise ValueError('invalid installed path')
+        parts = name.split('/')
+        if any(not part or part.endswith(('.', ' ')) or part.casefold() == 'user' for part in parts):
+            raise ValueError('invalid installed path')
+        path = folder.joinpath(*parts)
+        if path.resolve() != root.joinpath(*parts) or parts[0].casefold() == '.heylisten-get':
+            raise ValueError(f'unsafe installed path: {name}')
+        result.append(path)
     return result
 
 
@@ -964,7 +932,7 @@ def confirm_uninstall(message, gui=False):
 def uninstall(keep_saves=True, purge_saves=False, gui=False):
     folder = load_game_folder()
     if purge_saves:
-        message = 'This removes the game folder, including your saves, and the launcher files and settings.'
+        message = 'This removes installed game files, your saves, and the launcher files and settings.'
     else:
         saves = folder / 'user' if folder else '(game folder not configured)'
         message = ('This removes game files, shortcuts, launcher files and settings; the saves folder remains.\n'
@@ -1002,28 +970,45 @@ def _uninstall_locked(folder, purge_saves):
         if not remove_defender_exclusion():
             raise RuntimeError('Could not remove the Windows Defender exclusion; retry uninstall or remove it in Windows Security.')
         running = Path(sys.executable).resolve() if getattr(sys, 'frozen', False) else None
-        owned = manifest_owned_files(folder, ownership_manifest(folder))
-        owned.extend(folder / name for name in OWNED_FILES)
-        owned.append(folder / game_settings.INI_NAME)
-        owned.append(folder / '.heylisten-get' / 'game-manifest.json')
+        cache = folder / '.heylisten-get' / 'game-manifest.json'
+        try:
+            if cache.resolve() != game / '.heylisten-get' / cache.name:
+                raise ValueError('unsafe installed manifest path')
+            with cache.open(encoding='utf-8-sig') as stream:
+                owned = manifest_owned_files(folder, json.load(stream))
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
+            log_message(f'Uninstall incomplete; registration kept. Cannot read installed manifest: {exc}')
+            return False
+        leftovers = []
         for path in owned:
             try:
-                if path.resolve() != running and path.resolve().is_relative_to(folder.resolve()) and not path.is_symlink() and path.is_file():
-                    path.unlink()
-            except OSError:
-                pass
+                if path.resolve() == running:
+                    leftovers.append(str(path))
+                else:
+                    path.unlink(missing_ok=True)
+            except OSError as exc:
+                leftovers.append(f'{path}: {exc}')
+        if leftovers:
+            log_message('Uninstall incomplete; registration kept. Remaining files:\n' + '\n'.join(leftovers))
+            return False
         if purge_saves:
             saves = folder / 'user'
             if saves.is_dir() and not saves.is_symlink():
                 shutil.rmtree(saves)
+        try:
+            cache.unlink()
+        except OSError as exc:
+            log_message(f'Uninstall incomplete; registration kept. Remaining file: {exc}')
+            return False
         unknown = sum(1 for base, dirs, files in os.walk(folder, followlinks=False)
                       if not Path(base).relative_to(folder).parts or Path(base).relative_to(folder).parts[0].casefold() != 'user'
                       for name in files if (Path(base) / name).resolve() != running
                       and (Path(base) / name) != folder / '.heylisten-get' / 'install-operation.lock')
         log_message(f'Unknown user files preserved: {unknown}')
-        for base, dirs, files in os.walk(folder, topdown=False, followlinks=False):
+        directories = {parent for path in owned for parent in path.parents if parent.is_relative_to(folder)}
+        for base in sorted(directories, key=lambda path: len(path.parts), reverse=True):
             try:
-                Path(base).rmdir()
+                base.rmdir()
             except OSError:
                 pass
     if not had_folder and not remove_defender_exclusion():
