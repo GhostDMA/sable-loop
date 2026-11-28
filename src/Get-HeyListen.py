@@ -64,7 +64,7 @@ except ImportError:
     sys.exit("Missing dependency. Run:  python -m pip install curl_cffi")
 
 HERE = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 MAX_UPDATE_BYTES = 150 * 1024 * 1024
 MANIFEST_LOCAL = HERE / "sources.json"
 MANIFEST_CACHE = HERE / "sources.cache.json"
@@ -3124,17 +3124,15 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="sable-loop game downloader")
     ap.add_argument('--gui', action='store_true', help=argparse.SUPPRESS)
     ap.add_argument('--internal-trust-check', action='store_true', help=argparse.SUPPRESS)
-    ap.add_argument("--manifest", help="sources.json path or URL (default: next to this script)")
-    ap.add_argument("--out", default=None,
-                    help="folder for the .nup and builder (default: Downloads)")
-    ap.add_argument("--builder-only", action="store_true")
-    ap.add_argument("--game-only", action="store_true")
-    ap.add_argument("--skip-hash", action="store_true", help="skip the 25 GB SHA-256 check")
-    ap.add_argument("--force", action="store_true", help="re-download even if present")
-    ap.add_argument("--no-launch", action="store_true", help="don't open the game builder")
-    ap.add_argument("--no-preset", action="store_true", help="don't write the upscaler preset ini")
-    ap.add_argument("--game-dir", default=None,
-                    help="built game folder for the upscaler preset")
+    ap.add_argument("--manifest", help=argparse.SUPPRESS)
+    ap.add_argument("--out", default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--builder-only", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--game-only", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--skip-hash", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--force", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--no-launch", action="store_true", help="don't start the game")
+    ap.add_argument("--no-preset", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--game-dir", default=None, help="game folder")
     ap.add_argument("--print-sources", action="store_true", help="show the manifest and exit")
     ap.add_argument("--version", action="store_true", help="print the installed version and exit")
     ap.add_argument("--no-self-update", action="store_true",
@@ -3153,16 +3151,15 @@ def main() -> int:
     ap.add_argument('--update-dry-run', action='store_true')
     ap.add_argument('--force-update', action='store_true')
     ap.add_argument('--update-on-launch', action='store_true')
-    ap.add_argument('--builder-flow', action='store_true',
-                    help='old flow: download the game dump and open the builder')
+    ap.add_argument('--builder-flow', action='store_true', help=argparse.SUPPRESS)
     ap.add_argument('--uninstall', action='store_true', help='Remove the installed game and launcher')
     ap.add_argument('--keep-saves', action='store_true', help='Compatibility alias; saves are kept by default')
     ap.add_argument('--purge-saves', action='store_true', help='Remove saved games as well when uninstalling')
     ap.add_argument('--no-pause', action='store_true', help="don't wait for Enter before closing")
     ap.add_argument('--plain', action='store_true', help='no colors')
-    a = ap.parse_args()
     if getattr(sys, 'frozen', False):
         ensure_cli_console()
+    a = ap.parse_args()
 
     if a.internal_trust_check:
         try:
@@ -3389,7 +3386,7 @@ def run_builder_flow(s, a) -> int:
     if game is not None:
         say(f"  {Path(str(game)).name}   (the game data)")
     if builder:
-        say(f"  {Path(str(builder)).name}   (the Builder)")
+        say("  Game setup tool")
     if builder:
         say()
         say("Next steps, in the Builder window:")

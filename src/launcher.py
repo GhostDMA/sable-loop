@@ -74,7 +74,7 @@ def game_manifest_url():
     return MANIFEST_URL
 
 
-APP_VERSION = '1.0.1'
+APP_VERSION = '1.0.2'
 
 
 def windows_animations_enabled():
@@ -423,7 +423,8 @@ def register_install(folder, exe=None):
         return
     exe = exe or launcher_target(folder)
     try:
-        create_shortcut(Path(folder), exe=exe)
+        if defender_config().get('shortcut', True):
+            create_shortcut(Path(folder), exe=exe)
     except Exception as exc:
         log_message(f'Desktop shortcut: {exc}')
     try:
